@@ -1,0 +1,49 @@
+{
+	"format_version": 2,
+	"header": {
+		"description": "§aV3.0.0",
+		"name": "§l§bAnti§f-§cDupe",
+		"uuid": "eb5b8d37-a4f0-4fe5-b9b6-65df07cc57a8",
+		"version": [
+			3,
+			0,
+			0
+		],
+		"min_engine_version": [
+			1,
+			21,
+			90
+		]
+	},
+  "modules": [
+    {
+      "type": "data",
+      "uuid": "723914fb-1eae-439b-b015-0fe7488b8dbd",
+      "version": [
+        3,
+        0,
+        0
+      ]
+    },
+    {
+      "type": "script",
+      "language": "javascript",
+      "entry": "scripts/antidupe.js",
+      "uuid": "864815cb-aa4b-4d13-b1f7-ca7de9f7b75e",
+      "version": [
+        1,
+        0,
+        0
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "2.0.0"
+    }
+  ],
+  "capabilities": [
+    "script_eval"
+  ]
+}
