@@ -1,13 +1,13 @@
 {
 	"format_version": 2,
 	"header": {
-		"description": "§aV3.0.0",
+		"description": "§aV3.0.1",
 		"name": "§l§bAnti§f-§cDupe",
 		"uuid": "eb5b8d37-a4f0-4fe5-b9b6-65df07cc57a8",
 		"version": [
 			3,
 			0,
-			0
+			1
 		],
 		"min_engine_version": [
 			1,
@@ -22,7 +22,7 @@
       "version": [
         3,
         0,
-        0
+        1
       ]
     },
     {
@@ -40,7 +40,7 @@
   "dependencies": [
     {
       "module_name": "@minecraft/server",
-      "version": "2.0.0"
+      "version": "2.4.0"
     }
   ],
   "capabilities": [
