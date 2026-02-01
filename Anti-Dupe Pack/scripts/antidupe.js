@@ -6,22 +6,77 @@ import { ModalFormData, MessageFormData, ActionFormData } from "@minecraft/serve
 const SCAN_RADIUS = 4;
 const BLOCKS_PER_TICK_LIMIT = 2000;
 
+// Illegal stack enforcement
+const ILLEGAL_STACK_HARD_CAP = 64;   // hard cap
+const ILLEGAL_STACK_SCAN_TICKS = 40; // run every 2s (reduce if you want)
+
 // --- TAGS ---
 const ADMIN_TAG              = "Admin";
 const SETTINGS_ITEM          = "minecraft:bedrock";
+
+// LEGACY (previous per-admin patch toggles). Patch enable/disable is now WORLD CONFIG.
 const DISABLE_GHOST_TAG      = "antidupe:disable_ghost";
 const DISABLE_PLANT_TAG      = "antidupe:disable_plant";
 const DISABLE_HOPPER_TAG     = "antidupe:disable_hopper";
 const DISABLE_DROPPER_TAG    = "antidupe:disable_dropper";
+
+// Personal (per-admin) messaging preferences
 const DISABLE_ALERT_TAG      = "antidupe:disable_alert";
 const DISABLE_PUBLIC_MSG_TAG = "antidupe:disable_public_msg";
 const DISABLE_ADMIN_MSG_TAG  = "antidupe:disable_admin_msg";
 
 // --- PERSISTED LOG CONFIG (World Dynamic Property) ---
 const DUPE_LOGS_KEY = "antidupe:logs";
-// Conservative size cap to avoid dynamic property size/version edge cases.
-// We always trim old entries until serialized JSON fits.
 const DUPE_LOGS_MAX_CHARS = 12000;
+
+// --- GLOBAL CONFIG (World Dynamic Property) ---
+const GLOBAL_CONFIG_KEY = "antidupe:config";
+const GLOBAL_CONFIG_MAX_CHARS = 2400;
+
+// --- RESTRICTED ITEMS (CONFIGURABLE) ---
+const DEFAULT_RESTRICTED_ITEMS = [
+  "minecraft:bundle", "minecraft:red_bundle", "minecraft:blue_bundle",
+  "minecraft:black_bundle", "minecraft:cyan_bundle", "minecraft:brown_bundle",
+  "minecraft:gray_bundle", "minecraft:green_bundle", "minecraft:lime_bundle",
+  "minecraft:light_blue_bundle", "minecraft:light_gray_bundle",
+  "minecraft:magenta_bundle", "minecraft:orange_bundle", "minecraft:purple_bundle",
+  "minecraft:white_bundle", "minecraft:yellow_bundle", "minecraft:pink_bundle",
+];
+
+const MAX_RESTRICTED_ITEMS = 90; // prevents config overflow + UI spam
+
+const DEFAULT_GLOBAL_CONFIG = {
+  ghostPatch: true,
+  plantPatch: true,
+  hopperPatch: true,
+  dropperPatch: true,
+  illegalStackPatch: true,
+  restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(), // NEW
+};
+
+// --- VIOLATIONS (Scoreboards + Persistent Stats) ---
+/**
+ * Objective IDs MUST be short (common Bedrock limit is 16 chars).
+ * We keep these concise and use displayName for human-readable labels.
+ */
+const VIO_OBJ_TOTAL   = "ad_total";
+const VIO_OBJ_GHOST   = "ad_ghost";
+const VIO_OBJ_PLANT   = "ad_plant";
+const VIO_OBJ_HOPPER  = "ad_hopper";
+const VIO_OBJ_DROPPER = "ad_dropper";
+const VIO_OBJ_OTHER   = "ad_other";
+const VIO_OBJ_GLOBAL  = "ad_global"; // fake participant "#global" holds global count
+
+const GLOBAL_PARTICIPANT = "#global";
+
+const VIO_STATS_KEY = "antidupe:vstats";
+const VIO_STATS_MAX_CHARS = 4000;
+
+const DEFAULT_VIO_STATS = {
+  globalCount: 0,
+  mostRecent: { t: "", player: "", type: "" },
+  typeCounts: { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 },
+};
 
 // --- SETS & DATA ---
 const TWO_HIGH = new Set([
@@ -31,19 +86,55 @@ const TWO_HIGH = new Set([
   "minecraft:torchflower_crop", "minecraft:torchflower",
 ]);
 
-const BUNDLE_TYPES = new Set([
-  "minecraft:bundle", "minecraft:red_bundle", "minecraft:blue_bundle",
-  "minecraft:black_bundle", "minecraft:cyan_bundle", "minecraft:brown_bundle",
-  "minecraft:gray_bundle", "minecraft:green_bundle", "minecraft:lime_bundle",
-  "minecraft:light_blue_bundle", "minecraft:light_gray_bundle",
-  "minecraft:magenta_bundle", "minecraft:orange_bundle", "minecraft:purple_bundle",
-  "minecraft:white_bundle", "minecraft:yellow_bundle", "minecraft:pink_bundle",
-]);
-
 const PISTON_OFFSETS = [
   { x:  1, z:  0 }, { x: -1, z:  0 }, { x:  0, z:  1 }, { x:  0, z: -1 },
   { x:  1, z:  1 }, { x: -1, z:  1 }, { x:  1, z: -1 }, { x: -1, z: -1 },
 ];
+
+// -----------------------------
+// DEBUG (Runtime Only)
+// -----------------------------
+const DEBUG_LOG_MAX = 250;
+
+let debugLog = []; // runtime only
+let debugCounters = { info: 0, warn: 0, error: 0 };
+let debugLastByKey = Object.create(null);
+
+function dbgPush(level, area, message) {
+  try {
+    const lvl = String(level || "info").toLowerCase();
+    const entry = {
+      t: new Date().toISOString(),
+      tick: system.currentTick,
+      lvl,
+      area: String(area || "core"),
+      msg: String(message || ""),
+    };
+
+    debugLog.push(entry);
+    if (debugLog.length > DEBUG_LOG_MAX) debugLog.shift();
+
+    if (lvl === "error") debugCounters.error++;
+    else if (lvl === "warn") debugCounters.warn++;
+    else debugCounters.info++;
+  } catch {
+    // last resort: do nothing
+  }
+}
+
+function dbgInfo(area, msg) { dbgPush("info", area, msg); }
+function dbgWarn(area, msg) { dbgPush("warn", area, msg); }
+function dbgError(area, msg) { dbgPush("error", area, msg); }
+
+function dbgOncePer(key, minTicks, level, area, msg) {
+  try {
+    const now = system.currentTick;
+    const last = debugLastByKey[key] ?? -99999999;
+    if (now - last < minTicks) return;
+    debugLastByKey[key] = now;
+    dbgPush(level, area, msg);
+  } catch {}
+}
 
 // -----------------------------
 // Helpers (compat + safety)
@@ -52,16 +143,21 @@ function getPlayersSafe() {
   try {
     if (typeof world.getAllPlayers === "function") return world.getAllPlayers();
     if (typeof world.getPlayers === "function") return world.getPlayers();
-  } catch {}
+  } catch (e) {
+    dbgError("players", `getPlayersSafe failed: ${e}`);
+  }
   return [];
 }
 
 function runLater(fn, ticks = 0) {
   try {
     if (typeof system.runTimeout === "function") return system.runTimeout(fn, ticks);
-  } catch {}
-  // Fallback: immediate next tick at best
-  try { return system.run(fn); } catch {}
+  } catch (e) {
+    dbgWarn("scheduler", `runTimeout unavailable/failed: ${e}`);
+  }
+  try { return system.run(fn); } catch (e) {
+    dbgError("scheduler", `system.run failed: ${e}`);
+  }
 }
 
 function getEntityInventoryContainer(entity) {
@@ -70,7 +166,8 @@ function getEntityInventoryContainer(entity) {
       entity?.getComponent?.("minecraft:inventory") ??
       entity?.getComponent?.("inventory");
     return inv?.container ?? undefined;
-  } catch {
+  } catch (e) {
+    dbgWarn("inventory", `getEntityInventoryContainer failed: ${e}`);
     return undefined;
   }
 }
@@ -81,7 +178,8 @@ function getCursorInventory(entity) {
       entity?.getComponent?.("minecraft:cursor_inventory") ??
       entity?.getComponent?.("cursor_inventory")
     );
-  } catch {
+  } catch (e) {
+    dbgWarn("inventory", `getCursorInventory failed: ${e}`);
     return undefined;
   }
 }
@@ -92,19 +190,20 @@ function clearContainerSlot(container, slot) {
 }
 
 function setBlockToAir(block) {
-  // Prefer fast API call if present
   try {
     if (typeof block.setType === "function") {
       block.setType("minecraft:air");
       return true;
     }
-  } catch {}
+  } catch (e) {
+    dbgWarn("blocks", `block.setType failed: ${e}`);
+  }
 
-  // Command fallback (slower, but keeps patch working across API differences)
   try {
     const dim = block.dimension;
     const l = block.location;
     const x = Math.floor(l.x), y = Math.floor(l.y), z = Math.floor(l.z);
+
     if (typeof dim.runCommandAsync === "function") {
       dim.runCommandAsync(`setblock ${x} ${y} ${z} air`);
       return true;
@@ -113,12 +212,13 @@ function setBlockToAir(block) {
       dim.runCommand(`setblock ${x} ${y} ${z} air`);
       return true;
     }
-  } catch {}
+  } catch (e) {
+    dbgError("blocks", `setBlockToAir command fallback failed: ${e}`);
+  }
 
   return false;
 }
 
-// --- SAFE SLOT GETTER (prevents "Expected type: number") ---
 function getSelectedSlotSafe(player, containerSize) {
   const raw = player?.selectedSlot;
   let slot = (typeof raw === "number" && Number.isFinite(raw)) ? raw : 0;
@@ -129,20 +229,630 @@ function getSelectedSlotSafe(player, containerSize) {
   return slot;
 }
 
+function safeStringifyWithCap(value, capChars, fallbackObj) {
+  let raw;
+  try { raw = JSON.stringify(value); } catch { raw = ""; }
+  if (typeof raw !== "string") raw = "";
+  if (raw.length <= capChars) return raw;
+  try { return JSON.stringify(fallbackObj ?? {}); } catch { return "{}"; }
+}
+
+function clampInt(n, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.floor(v);
+}
+
 // -----------------------------
-// Persistent Dupe Logs (Option A)
+// Dimension helpers (FIX: no more "unknown")
 // -----------------------------
+function dimensionIdFromDimension(dim) {
+  try {
+    if (!dim) return "unknown";
+    const id = dim?.id ?? dim?.dimensionId ?? dim?.type ?? dim?.name;
+    if (typeof id === "string" && id.length) return id;
+
+    // Fallback: compare known dimension objects
+    try { if (dim === world.getDimension?.("overworld")) return "minecraft:overworld"; } catch {}
+    try { if (dim === world.getDimension?.("nether")) return "minecraft:nether"; } catch {}
+    try { if (dim === world.getDimension?.("the_end")) return "minecraft:the_end"; } catch {}
+
+    return "unknown";
+  } catch (e) {
+    dbgWarn("dimension", `dimensionIdFromDimension failed: ${e}`);
+    return "unknown";
+  }
+}
+
+function prettyDimension(id) {
+  const s = String(id ?? "").toLowerCase();
+  if (s.includes("overworld")) return "Overworld";
+  if (s.includes("nether")) return "Nether";
+  if (s.includes("the_end") || (s.includes("end") && !s.includes("vendor"))) return "The End";
+  if (s && s !== "unknown") return s;
+  return "Unknown";
+}
+
+function safeDimIdFromEntity(entity) {
+  try {
+    const dim = entity?.dimension;
+    return dimensionIdFromDimension(dim);
+  } catch (e) {
+    dbgWarn("dimension", `safeDimIdFromEntity failed: ${e}`);
+    return "unknown";
+  }
+}
+
+// -----------------------------
+// Persistence Flags
+// -----------------------------
+const persistenceEnabled =
+  typeof world.getDynamicProperty === "function" &&
+  typeof world.setDynamicProperty === "function";
+
+dbgInfo("boot", `Persistence enabled: ${persistenceEnabled ? "true" : "false"}`);
+
+// -----------------------------
+// GLOBAL CONFIG (World Dynamic Property)
+// -----------------------------
+let globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
+let configLoaded = false;
+let configDirty = false;
+let configSaveQueued = false;
+
+// Cached restricted item set (do NOT rebuild per-scan)
+let restrictedItemsSet = new Set(DEFAULT_RESTRICTED_ITEMS);
+
+function isValidNamespacedId(s) {
+  const v = String(s ?? "").trim().toLowerCase();
+  // simple + safe: namespace:item (letters, digits, _, -, .)
+  return /^[a-z0-9_.-]+:[a-z0-9_.-]+$/.test(v);
+}
+
+function sanitizeRestrictedItems(arr) {
+  const out = [];
+  const seen = new Set();
+
+  const src = Array.isArray(arr) ? arr : [];
+  for (const raw of src) {
+    const v = String(raw ?? "").trim().toLowerCase();
+    if (!v) continue;
+    if (!isValidNamespacedId(v)) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+    if (out.length >= MAX_RESTRICTED_ITEMS) break;
+  }
+
+  return out;
+}
+
+function rebuildRestrictedItemsSet() {
+  try {
+    const list = Array.isArray(globalConfig.restrictedItems)
+      ? globalConfig.restrictedItems
+      : DEFAULT_RESTRICTED_ITEMS;
+
+    restrictedItemsSet = new Set(list.map(v => String(v).toLowerCase()));
+    dbgInfo("config", `Restricted items set rebuilt (count=${restrictedItemsSet.size})`);
+  } catch (e) {
+    restrictedItemsSet = new Set(DEFAULT_RESTRICTED_ITEMS);
+    dbgError("config", `Failed to rebuild restricted item set; reverted to defaults: ${e}`);
+  }
+}
+
+function normalizeConfig(obj) {
+  const cfg = { ...DEFAULT_GLOBAL_CONFIG };
+
+  if (obj && typeof obj === "object") {
+    if ("ghostPatch"         in obj) cfg.ghostPatch         = !!obj.ghostPatch;
+    if ("plantPatch"         in obj) cfg.plantPatch         = !!obj.plantPatch;
+    if ("hopperPatch"        in obj) cfg.hopperPatch        = !!obj.hopperPatch;
+    if ("dropperPatch"       in obj) cfg.dropperPatch       = !!obj.dropperPatch;
+    if ("illegalStackPatch"  in obj) cfg.illegalStackPatch  = !!obj.illegalStackPatch;
+
+    if ("restrictedItems" in obj) {
+      const cleaned = sanitizeRestrictedItems(obj.restrictedItems);
+      cfg.restrictedItems = cleaned.length ? cleaned : DEFAULT_RESTRICTED_ITEMS.slice();
+    } else {
+      cfg.restrictedItems = DEFAULT_RESTRICTED_ITEMS.slice();
+    }
+  }
+
+  return cfg;
+}
+
+/**
+ * Ensures config fits GLOBAL_CONFIG_MAX_CHARS by trimming restrictedItems if required.
+ * This avoids "full fallback to defaults" when admins add many items.
+ */
+function safeStringifyConfigWithCap(cfg) {
+  const temp = normalizeConfig(cfg);
+  let trimmed = 0;
+
+  while (true) {
+    let raw = "";
+    try { raw = JSON.stringify(temp); } catch { raw = ""; }
+
+    if (raw && raw.length <= GLOBAL_CONFIG_MAX_CHARS) {
+      return { raw, trimmed };
+    }
+
+    // If too large, trim restrictedItems first
+    if (Array.isArray(temp.restrictedItems) && temp.restrictedItems.length > 0) {
+      temp.restrictedItems.pop();
+      trimmed++;
+      continue;
+    }
+
+    // Absolute last resort
+    try {
+      const def = normalizeConfig(DEFAULT_GLOBAL_CONFIG);
+      return { raw: JSON.stringify(def), trimmed: -1 };
+    } catch {
+      return { raw: "{}", trimmed: -1 };
+    }
+  }
+}
+
+function loadGlobalConfig() {
+  if (configLoaded) return;
+  configLoaded = true;
+
+  if (!persistenceEnabled) {
+    globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
+    rebuildRestrictedItemsSet();
+    dbgWarn("config", "Dynamic properties unavailable; using default config (non-persistent).");
+    return;
+  }
+
+  try {
+    const raw = world.getDynamicProperty(GLOBAL_CONFIG_KEY);
+
+    if (typeof raw !== "string" || raw.length === 0) {
+      globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
+      rebuildRestrictedItemsSet();
+      dbgInfo("config", "No saved config found; using defaults.");
+      return;
+    }
+
+    globalConfig = normalizeConfig(JSON.parse(raw));
+    rebuildRestrictedItemsSet();
+    dbgInfo("config", "Loaded global config successfully.");
+  } catch (e) {
+    console.warn(`[Anti-Dupe] Failed to load global config: ${e}`);
+    dbgError("config", `Failed to load global config; reverted to defaults: ${e}`);
+    globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
+    rebuildRestrictedItemsSet();
+  }
+}
+
+function saveGlobalConfigNow() {
+  if (!persistenceEnabled) return;
+  if (!configDirty) return;
+
+  try {
+    const { raw, trimmed } = safeStringifyConfigWithCap(globalConfig);
+    world.setDynamicProperty(GLOBAL_CONFIG_KEY, raw);
+    configDirty = false;
+
+    if (trimmed > 0) {
+      dbgWarn("config", `Config exceeded size cap; trimmed restrictedItems by ${trimmed}.`);
+      // also update in-memory to match what was saved
+      try {
+        globalConfig = normalizeConfig(JSON.parse(raw));
+        rebuildRestrictedItemsSet();
+      } catch {}
+    } else if (trimmed === -1) {
+      dbgError("config", "Config exceeded size cap and could not be trimmed; fallback config saved.");
+    } else {
+      dbgInfo("config", "Global config saved.");
+    }
+  } catch (e) {
+    console.warn(`[Anti-Dupe] Failed to save global config: ${e}`);
+    dbgError("config", `Failed to save global config: ${e}`);
+  }
+}
+
+function queueSaveGlobalConfig() {
+  configDirty = true;
+  if (!persistenceEnabled) return;
+  if (configSaveQueued) return;
+
+  configSaveQueued = true;
+  runLater(() => {
+    configSaveQueued = false;
+    saveGlobalConfigNow();
+  }, 40);
+}
+
+runLater(loadGlobalConfig, 1);
+try {
+  world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadGlobalConfig, 1));
+} catch (e) {
+  dbgWarn("config", `worldInitialize subscribe failed: ${e}`);
+}
+
+system.runInterval(() => {
+  try { saveGlobalConfigNow(); } catch {}
+}, 200);
+
+// -----------------------------
+// VIOLATIONS: Scoreboard bootstrap + persistent stats
+// -----------------------------
+let vioStats = { ...DEFAULT_VIO_STATS };
+let vioStatsLoaded = false;
+let vioStatsDirty = false;
+let vioStatsSaveQueued = false;
+
+let vioObjectivesReady = false;
+let vioInitAttempted = false;
+
+function normalizeVioStats(obj) {
+  const out = JSON.parse(JSON.stringify(DEFAULT_VIO_STATS));
+  if (!obj || typeof obj !== "object") return out;
+
+  out.globalCount = Number.isFinite(obj.globalCount) ? obj.globalCount : 0;
+
+  const mr = obj.mostRecent;
+  if (mr && typeof mr === "object") {
+    out.mostRecent.t = typeof mr.t === "string" ? mr.t : "";
+    out.mostRecent.player = typeof mr.player === "string" ? mr.player : "";
+    out.mostRecent.type = typeof mr.type === "string" ? mr.type : "";
+  }
+
+  const tc = obj.typeCounts;
+  if (tc && typeof tc === "object") {
+    out.typeCounts.ghost   = Number.isFinite(tc.ghost)   ? tc.ghost   : 0;
+    out.typeCounts.plant   = Number.isFinite(tc.plant)   ? tc.plant   : 0;
+    out.typeCounts.hopper  = Number.isFinite(tc.hopper)  ? tc.hopper  : 0;
+    out.typeCounts.dropper = Number.isFinite(tc.dropper) ? tc.dropper : 0;
+    out.typeCounts.other   = Number.isFinite(tc.other)   ? tc.other   : 0;
+  }
+
+  return out;
+}
+
+function loadVioStats() {
+  if (vioStatsLoaded) return;
+  vioStatsLoaded = true;
+
+  if (!persistenceEnabled) {
+    vioStats = normalizeVioStats(DEFAULT_VIO_STATS);
+    dbgWarn("violations", "Dynamic properties unavailable; violation stats will not persist.");
+    return;
+  }
+
+  try {
+    const raw = world.getDynamicProperty(VIO_STATS_KEY);
+    if (typeof raw !== "string" || raw.length === 0) {
+      vioStats = normalizeVioStats(DEFAULT_VIO_STATS);
+      dbgInfo("violations", "No saved violation stats found; starting from zero.");
+      return;
+    }
+    vioStats = normalizeVioStats(JSON.parse(raw));
+    dbgInfo("violations", "Loaded violation stats.");
+  } catch (e) {
+    console.warn(`[Anti-Dupe] Failed to load violation stats: ${e}`);
+    dbgError("violations", `Failed to load violation stats; reset to defaults: ${e}`);
+    vioStats = normalizeVioStats(DEFAULT_VIO_STATS);
+  }
+}
+
+function saveVioStatsNow() {
+  if (!persistenceEnabled) return;
+  if (!vioStatsDirty) return;
+
+  try {
+    const raw = safeStringifyWithCap(vioStats, VIO_STATS_MAX_CHARS, DEFAULT_VIO_STATS);
+    world.setDynamicProperty(VIO_STATS_KEY, raw);
+    vioStatsDirty = false;
+    dbgInfo("violations", "Violation stats saved.");
+  } catch (e) {
+    console.warn(`[Anti-Dupe] Failed to save violation stats: ${e}`);
+    dbgError("violations", `Failed to save violation stats: ${e}`);
+  }
+}
+
+function queueSaveVioStats() {
+  vioStatsDirty = true;
+  if (!persistenceEnabled) return;
+  if (vioStatsSaveQueued) return;
+
+  vioStatsSaveQueued = true;
+  runLater(() => {
+    vioStatsSaveQueued = false;
+    saveVioStatsNow();
+  }, 40);
+}
+
+system.runInterval(() => {
+  try { saveVioStatsNow(); } catch {}
+}, 200);
+
+runLater(loadVioStats, 1);
+try {
+  world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadVioStats, 1));
+} catch {}
+
+// Objective helpers
+function ensureObjective(id, displayName) {
+  try {
+    const sb = world.scoreboard;
+    if (!sb) {
+      dbgOncePer("no_scoreboard", 200, "warn", "violations", "Scoreboard API unavailable (cannot create objectives).");
+      return undefined;
+    }
+
+    let obj = sb.getObjective(id);
+    if (!obj) {
+      obj = sb.addObjective(id, displayName);
+      dbgInfo("violations", `Created objective: ${id}`);
+    }
+    return obj;
+  } catch (e) {
+    console.warn(`[Anti-Dupe] ensureObjective(${id}) failed: ${e}`);
+    dbgError("violations", `ensureObjective(${id}) failed: ${e}`);
+    return undefined;
+  }
+}
+
+function ensureViolationObjectives() {
+  if (vioObjectivesReady) return true;
+
+  if (vioInitAttempted && !vioObjectivesReady) return false;
+  vioInitAttempted = true;
+
+  const objs = [
+    ensureObjective(VIO_OBJ_TOTAL,   "AntiDupe Total Violations"),
+    ensureObjective(VIO_OBJ_GHOST,   "AntiDupe Ghost Violations"),
+    ensureObjective(VIO_OBJ_PLANT,   "AntiDupe Plant Violations"),
+    ensureObjective(VIO_OBJ_HOPPER,  "AntiDupe Hopper Violations"),
+    ensureObjective(VIO_OBJ_DROPPER, "AntiDupe Dropper Violations"),
+    ensureObjective(VIO_OBJ_OTHER,   "AntiDupe Other Violations"),
+    ensureObjective(VIO_OBJ_GLOBAL,  "AntiDupe Global Violations"),
+  ];
+
+  const ok = objs.every(Boolean);
+  vioObjectivesReady = ok;
+
+  if (ok) {
+    dbgInfo("violations", "Violation objectives ready.");
+  } else {
+    dbgWarn("violations", "Violation objectives not ready; retry scheduled.");
+    vioInitAttempted = false;
+    runLater(ensureViolationObjectives, 40);
+  }
+
+  return ok;
+}
+
+runLater(ensureViolationObjectives, 20);
+try {
+  world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(ensureViolationObjectives, 20));
+} catch {}
+
+function dupeTypeKey(dupeType) {
+  // user-facing types: "Hopper Dupe", "Piston Dupe", etc.
+  const s = String(dupeType ?? "").toLowerCase();
+  if (s.includes("ghost")) return "ghost";
+  if (s.includes("piston") || s.includes("plant")) return "plant";
+  if (s.includes("hopper")) return "hopper";
+  if (s.includes("dropper")) return "dropper";
+  return "other";
+}
+
+function objectiveIdForKey(k) {
+  switch (k) {
+    case "ghost": return VIO_OBJ_GHOST;
+    case "plant": return VIO_OBJ_PLANT;
+    case "hopper": return VIO_OBJ_HOPPER;
+    case "dropper": return VIO_OBJ_DROPPER;
+    default: return VIO_OBJ_OTHER;
+  }
+}
+
+function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
+  if (!objective) return 0;
+
+  try {
+    const v = objective.getScore?.(entity);
+    if (Number.isFinite(v)) return v;
+  } catch {}
+
+  try {
+    const scores = objective.getScores?.() ?? [];
+    for (const s of scores) {
+      const p = s?.participant;
+      const dn = p?.displayName;
+      if (dn && nameFallback && dn === nameFallback) return s?.score ?? 0;
+    }
+  } catch {}
+
+  return 0;
+}
+
+/**
+ * Increments violations (per-player total + per-type + global),
+ * updates persistent tallies, and returns the post-increment totals (best effort).
+ */
+function recordViolation(offender, incidentType) {
+  try {
+    if (!offender) return { key: "other", total: 0, typeScore: 0, global: 0 };
+
+    if (!vioStatsLoaded) loadVioStats();
+    ensureViolationObjectives();
+
+    const key = dupeTypeKey(incidentType);
+    const name = offender.nameTag ?? offender.name ?? "Unknown";
+
+    try {
+      const sb = world.scoreboard;
+      if (sb) {
+        const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
+        const typeObj  = sb.getObjective(objectiveIdForKey(key));
+        const globObj  = sb.getObjective(VIO_OBJ_GLOBAL);
+
+        totalObj?.addScore?.(offender, 1);
+        typeObj?.addScore?.(offender, 1);
+        globObj?.addScore?.(GLOBAL_PARTICIPANT, 1);
+      } else {
+        dbgOncePer("no_scoreboard_add", 200, "warn", "violations", "Cannot increment scores: scoreboard not available.");
+      }
+    } catch (e) {
+      console.warn(`[Anti-Dupe] recordViolation scoreboard update failed: ${e}`);
+      dbgError("violations", `recordViolation scoreboard update failed: ${e}`);
+    }
+
+    vioStats.globalCount = (vioStats.globalCount | 0) + 1;
+
+    if (!vioStats.typeCounts || typeof vioStats.typeCounts !== "object") {
+      vioStats.typeCounts = { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 };
+    }
+    vioStats.typeCounts[key] = (vioStats.typeCounts[key] | 0) + 1;
+
+    vioStats.mostRecent = {
+      t: new Date().toISOString(),
+      player: name,
+      type: String(incidentType ?? "Unknown"),
+    };
+
+    queueSaveVioStats();
+
+    let total = 0;
+    let typeScore = 0;
+    let global = 0;
+
+    try {
+      const sb = world.scoreboard;
+      if (sb) {
+        const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
+        const typeObj  = sb.getObjective(objectiveIdForKey(key));
+        const globObj  = sb.getObjective(VIO_OBJ_GLOBAL);
+
+        total = tryGetScoreByEntityOrName(totalObj, offender, name);
+        typeScore = tryGetScoreByEntityOrName(typeObj, offender, name);
+
+        try {
+          const g = globObj?.getScore?.(GLOBAL_PARTICIPANT);
+          if (Number.isFinite(g)) global = g;
+          else {
+            const scores = globObj?.getScores?.() ?? [];
+            for (const s of scores) {
+              if (s?.participant?.displayName === GLOBAL_PARTICIPANT) { global = s?.score ?? 0; break; }
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+
+    return { key, total, typeScore, global };
+  } catch (e) {
+    console.warn(`[Anti-Dupe] recordViolation failed: ${e}`);
+    dbgError("violations", `recordViolation failed: ${e}`);
+    return { key: "other", total: 0, typeScore: 0, global: 0 };
+  }
+}
+
+function getViolationsTable() {
+  try {
+    const sb = world.scoreboard;
+    if (!sb) return { rows: [], note: "Scoreboard unavailable." };
+
+    const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
+    if (!totalObj) return { rows: [], note: "Violation objectives not initialized yet." };
+
+    let scores = [];
+    try {
+      scores = totalObj.getScores?.() ?? [];
+    } catch (e) {
+      return { rows: [], note: `Could not read scores: ${e}` };
+    }
+
+    const rows = [];
+    for (const info of scores) {
+      const participant = info?.participant;
+      const total = info?.score ?? 0;
+      if (!participant || total <= 0) continue;
+
+      const pname = participant.displayName ?? "Unknown";
+      if (pname === GLOBAL_PARTICIPANT) continue;
+
+      const ghostObj = sb.getObjective(VIO_OBJ_GHOST);
+      const plantObj = sb.getObjective(VIO_OBJ_PLANT);
+      const hopObj   = sb.getObjective(VIO_OBJ_HOPPER);
+      const dropObj  = sb.getObjective(VIO_OBJ_DROPPER);
+      const otherObj = sb.getObjective(VIO_OBJ_OTHER);
+
+      const ghost = ghostObj?.getScore?.(participant) ?? 0;
+      const plant = plantObj?.getScore?.(participant) ?? 0;
+      const hopper = hopObj?.getScore?.(participant) ?? 0;
+      const dropper = dropObj?.getScore?.(participant) ?? 0;
+      const other = otherObj?.getScore?.(participant) ?? 0;
+
+      rows.push({ name: pname, total, ghost, plant, hopper, dropper, other });
+    }
+
+    rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
+    return { rows, note: "" };
+  } catch (e) {
+    return { rows: [], note: `Violations table error: ${e}` };
+  }
+}
+
+function getMostUsedViolationType() {
+  const tc = vioStats?.typeCounts;
+  if (!tc || typeof tc !== "object") return { key: "None", count: 0 };
+
+  let bestKey = "None";
+  let best = 0;
+
+  for (const k of ["ghost", "plant", "hopper", "dropper", "other"]) {
+    const v = Number.isFinite(tc[k]) ? tc[k] : 0;
+    if (v > best) {
+      best = v;
+      bestKey = k;
+    }
+  }
+  return { key: bestKey, count: best };
+}
+
+function prettyTypeKey(k) {
+  switch (k) {
+    case "ghost": return "Ghost Stack";
+    case "plant": return "Piston";
+    case "hopper": return "Hopper";
+    case "dropper": return "Dropper";
+    case "other": return "Other";
+    default: return String(k ?? "Unknown");
+  }
+}
+
+// -----------------------------
+// INCIDENT LOGS (Persistent)
+// -----------------------------
+/**
+ * Storage format (compact keys to stay under dynamic property size cap):
+ * {
+ *   t: ISO timestamp,
+ *   p: player name,
+ *   ty: incident type (user-facing),
+ *   it: item/context,
+ *   d: dimension id,
+ *   x,y,z: coords,
+ *   n: [nearby player names],
+ *   vt: total violations after incident (best effort),
+ *   vty: violations for this bucket after incident (best effort),
+ *   vk: violation key (ghost/plant/hopper/dropper/other),
+ *   m: mitigation string
+ * }
+ */
 let dupeLogs = [];
 let logsLoaded = false;
 let logsDirty = false;
 let saveQueued = false;
 
-const persistenceEnabled =
-  typeof world.getDynamicProperty === "function" &&
-  typeof world.setDynamicProperty === "function";
-
 function safeStringifyLogs(arr) {
-  // Trim oldest until JSON fits.
   while (true) {
     let raw;
     try { raw = JSON.stringify(arr); } catch { raw = "[]"; }
@@ -157,8 +867,8 @@ function loadLogs() {
   logsLoaded = true;
 
   if (!persistenceEnabled) {
-    // No persistence available in this runtime — keep memory-only logs.
     dupeLogs = [];
+    dbgWarn("logs", "Dynamic properties unavailable; incident logs will not persist.");
     return;
   }
 
@@ -166,12 +876,15 @@ function loadLogs() {
     const raw = world.getDynamicProperty(DUPE_LOGS_KEY);
     if (typeof raw !== "string" || raw.length === 0) {
       dupeLogs = [];
+      dbgInfo("logs", "No saved incident logs found.");
       return;
     }
     const parsed = JSON.parse(raw);
     dupeLogs = Array.isArray(parsed) ? parsed : [];
+    dbgInfo("logs", `Loaded incident logs (count=${dupeLogs.length}).`);
   } catch (e) {
     console.warn(`[Anti-Dupe] Failed to load logs: ${e}`);
+    dbgError("logs", `Failed to load incident logs; reset to empty: ${e}`);
     dupeLogs = [];
   }
 }
@@ -184,8 +897,10 @@ function saveLogsNow() {
     const raw = safeStringifyLogs(dupeLogs);
     world.setDynamicProperty(DUPE_LOGS_KEY, raw);
     logsDirty = false;
+    dbgInfo("logs", "Incident logs saved.");
   } catch (e) {
     console.warn(`[Anti-Dupe] Failed to save logs: ${e}`);
+    dbgError("logs", `Failed to save incident logs: ${e}`);
   }
 }
 
@@ -198,7 +913,7 @@ function queueSaveLogs() {
   runLater(() => {
     saveQueued = false;
     saveLogsNow();
-  }, 40); // ~2 seconds (debounce)
+  }, 40);
 }
 
 function addDupeLog(entry) {
@@ -207,19 +922,124 @@ function addDupeLog(entry) {
   queueSaveLogs();
 }
 
-// Load logs as early as possible (next tick), and also on worldInitialize if present.
 runLater(loadLogs, 1);
 try {
   world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadLogs, 1));
 } catch {}
 
-// Periodic flush in case the server closes before debounce fires
 system.runInterval(() => {
   try { saveLogsNow(); } catch {}
-}, 200); // every 10 seconds
+}, 200);
 
 // -----------------------------
-// Nearby players helper (used in alerts)
+// Incident Log formatting (UI)
+// -----------------------------
+function parseLegacyLogString(s) {
+  // Legacy format: `${stamp} | ${name} | ${dupeType} | ${itemDesc} | ${coordStr} | nearby: ${nearList}`
+  try {
+    const parts = String(s).split(" | ");
+    if (parts.length < 5) return null;
+
+    const t = parts[0] ?? "";
+    const p = parts[1] ?? "Unknown";
+    const ty = parts[2] ?? "Unknown";
+    const it = parts[3] ?? "";
+
+    const coordStr = parts[4] ?? "";
+    const m = coordStr.match(/(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)/);
+    const x = m ? clampInt(m[1]) : 0;
+    const y = m ? clampInt(m[2]) : 0;
+    const z = m ? clampInt(m[3]) : 0;
+
+    let near = "";
+    if (parts.length >= 6) near = String(parts[5] ?? "").replace(/^nearby:\s*/i, "").trim();
+    const n = near && near.toLowerCase() !== "none" ? near.split(",").map(v => v.trim()).filter(Boolean) : [];
+
+    // Dimension cannot be recovered from old entries
+    return { t, p, ty, it, d: "unknown", x, y, z, n, m: "" };
+  } catch {
+    return null;
+  }
+}
+
+function formatIncidentEntry(entry) {
+  const e = (typeof entry === "string")
+    ? (parseLegacyLogString(entry) ?? { t: "", p: "Unknown", ty: String(entry) })
+    : entry;
+
+  const username = e?.p ?? "Unknown";
+  const time = e?.t ?? "";
+  const type = e?.ty ?? "Unknown";
+  const item = e?.it ?? "";
+  const dimId = e?.d ?? "unknown";
+  const dimLabel = prettyDimension(dimId);
+
+  const x = Number.isFinite(e?.x) ? e.x : clampInt(e?.x, 0);
+  const y = Number.isFinite(e?.y) ? e.y : clampInt(e?.y, 0);
+  const z = Number.isFinite(e?.z) ? e.z : clampInt(e?.z, 0);
+
+  const nearbyArr = Array.isArray(e?.n) ? e.n : [];
+  const nearby = nearbyArr.length ? nearbyArr.join(", ") : "None";
+
+  const vk = e?.vk ? String(e.vk) : "";
+  const vTotal = Number.isFinite(e?.vt) ? e.vt : null;
+  const vType = Number.isFinite(e?.vty) ? e.vty : null;
+
+  const mitigation = e?.m ? String(e.m) : "";
+
+  const lines = [];
+  lines.push(`Username: ${username}`);
+  lines.push(`Time: ${time || "Unknown"}`);
+  lines.push(`Type of Dupe: ${type}`);
+  if (item) lines.push(`Item / Context: ${item}`);
+  lines.push(`Dimension: ${dimLabel}${dimId && dimId !== "unknown" ? ` (${dimId})` : ""}`);
+  lines.push(`Coordinates: ${x}, ${y}, ${z}`);
+  lines.push(`Nearby Players: ${nearby}`);
+
+  if (vTotal !== null) lines.push(`Total Violations (After): ${vTotal}`);
+  if (vk && vType !== null) lines.push(`Violations for Type (After): ${prettyTypeKey(vk)} (${vType})`);
+  if (mitigation) lines.push(`Mitigation: ${mitigation}`);
+
+  lines.push("");
+  lines.push("---");
+
+  return lines.join("\n");
+}
+
+function formatIncidentLogsText(maxEntries = 25) {
+  const total = dupeLogs.length;
+  if (total === 0) return "No incident logs.";
+
+  const newestFirst = [...dupeLogs].reverse();
+  const slice = newestFirst.slice(0, maxEntries);
+  const blocks = slice.map(formatIncidentEntry);
+
+  let header = `Incident Logs (${Math.min(total, maxEntries)}/${total} shown)\n\n`;
+  let body = blocks.join("\n");
+
+  if (total > maxEntries) {
+    body += `\n\n---\n\nNote: ${total - maxEntries} older entr${total - maxEntries === 1 ? "y" : "ies"} not shown.`;
+  }
+
+  return header + body;
+}
+
+function getMostRecentIncidentSummary() {
+  try {
+    if (!dupeLogs.length) return "None";
+    const latest = dupeLogs[dupeLogs.length - 1];
+    const e = (typeof latest === "string") ? parseLegacyLogString(latest) : latest;
+    const p = e?.p ?? "Unknown";
+    const ty = e?.ty ?? "Unknown";
+    const t = e?.t ?? "";
+    return `${p} — ${ty}${t ? ` @ ${t}` : ""}`;
+  } catch {
+    return "Unknown";
+  }
+}
+
+// -----------------------------
+// Nearby players helper
 // -----------------------------
 function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
   const players = getPlayersSafe();
@@ -246,75 +1066,283 @@ function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
 }
 
 // -----------------------------
-// Alerts
+// Alerts / Reporting
 // -----------------------------
 function sendAdminAlert(message) {
   const admins = getPlayersSafe().filter((p) => p?.hasTag?.(ADMIN_TAG));
+  if (!admins.length) {
+    dbgOncePer("no_admins", 200, "warn", "alerts", "No admins online to receive admin alerts.");
+  }
+
   for (const admin of admins) {
     if (admin.hasTag?.(DISABLE_ADMIN_MSG_TAG) || admin.hasTag?.(DISABLE_ALERT_TAG)) continue;
-    try { admin.sendMessage(message); } catch {}
+    try { admin.sendMessage(message); } catch (e) {
+      dbgWarn("alerts", `Failed to send admin alert to ${admin?.nameTag ?? "admin"}: ${e}`);
+    }
   }
 }
 
-function alertDupe(offender, dupeType, itemDesc, loc) {
-  // Hardening: alerts must never crash scanner
+/**
+ * reportIncident:
+ * - records a violation
+ * - writes structured log
+ * - sends public + admin messages
+ *
+ * mode:
+ *  - "attempt": "attempted a ..."
+ *  - "detected": "was found with ..."
+ */
+function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", mode = "attempt", messageNote = "") {
   try {
-    if (!offender || !loc) return;
+    if (!offender || !loc) {
+      dbgWarn("incident", "reportIncident called with missing offender or location.");
+      return;
+    }
 
-    const coordStr = `${Math.floor(loc.x)}, ${Math.floor(loc.y)}, ${Math.floor(loc.z)}`;
-    const nearby   = getNearbyPlayers(offender, loc, 50, 12);
-    const nearList = nearby.length > 0 ? nearby.join(", ") : "None";
+    if (!logsLoaded) loadLogs();
+    if (!vioStatsLoaded) loadVioStats();
 
     const name = offender.nameTag ?? offender.name ?? "Unknown";
-    const broadcastMsg = `§c<Anti-Dupe> §f§l${name}§r §7attempted a ${dupeType} with §f${itemDesc}§r.`;
-    const adminMsg = `§c<Anti-Dupe> §6Admin Alert: §f§l${name}§r §7attempted a ${dupeType} with §f${itemDesc}§r at §e§l${coordStr}§r.\n§7Nearby: §e${nearList}§r.`;
-
-    // Timestamp without depending on locale formatting
     const stamp = new Date().toISOString();
-    addDupeLog(`${stamp} | ${name} | ${dupeType} | ${itemDesc} | ${coordStr} | nearby: ${nearList}`);
+
+    const dimId = safeDimIdFromEntity(offender);
+    const dimLabel = prettyDimension(dimId);
+
+    const x = clampInt(loc.x);
+    const y = clampInt(loc.y);
+    const z = clampInt(loc.z);
+
+    const nearbyArr = getNearbyPlayers(offender, loc, 50, 12);
+    const nearList = nearbyArr.length > 0 ? nearbyArr.join(", ") : "None";
+    const coordStr = `${x}, ${y}, ${z}`;
+
+    // 1) Violation increments (best effort)
+    const vio = recordViolation(offender, incidentType);
+
+    // 2) Log entry
+    addDupeLog({
+      t: stamp,
+      p: name,
+      ty: String(incidentType ?? "Unknown"),
+      it: String(itemDesc ?? ""),
+      d: dimId,
+      x, y, z,
+      n: nearbyArr,
+      vt: Number.isFinite(vio?.total) ? vio.total : undefined,
+      vty: Number.isFinite(vio?.typeScore) ? vio.typeScore : undefined,
+      vk: vio?.key ? String(vio.key) : undefined,
+      m: String(mitigation ?? ""),
+    });
+
+    // 3) Messaging
+    const noteText = messageNote ? ` §7${messageNote}§r` : "";
+    const baseTag = "§c<Anti-Dupe>§r";
+    const who = `§f§l${name}§r`;
+
+    let broadcastMsg;
+    let adminMsg;
+
+    if (mode === "detected") {
+      broadcastMsg = `${baseTag} ${who} §7was found with §f${incidentType}§r§7: §f${itemDesc}§r.§7 Item removed.§r${noteText}`;
+      adminMsg = `${baseTag} §6Admin Alert:§r ${who} §7was found with §f${incidentType}§r§7: §f${itemDesc}§r ` +
+                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby: §e${nearList}§r.${noteText}`;
+    } else {
+      broadcastMsg = `${baseTag} ${who} §7attempted a §f${incidentType}§r §7with §f${itemDesc}§r.§r${noteText}`;
+      adminMsg = `${baseTag} §6Admin Alert:§r ${who} §7attempted a §f${incidentType}§r §7with §f${itemDesc}§r ` +
+                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby: §e${nearList}§r.${noteText}`;
+    }
 
     for (const p of getPlayersSafe()) {
       if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
-        try { p.sendMessage(broadcastMsg); } catch {}
+        try { p.sendMessage(broadcastMsg); } catch (e) {
+          dbgWarn("alerts", `Failed public message send: ${e}`);
+        }
       }
     }
     sendAdminAlert(adminMsg);
+
+    dbgInfo("incident", `${name} | ${mode} | ${incidentType} | ${itemDesc} | ${dimId} @ ${coordStr}`);
   } catch (e) {
-    console.warn(`[Anti-Dupe] alertDupe failed: ${e}`);
+    console.warn(`[Anti-Dupe] reportIncident failed: ${e}`);
+    dbgError("incident", `reportIncident failed: ${e}`);
   }
 }
 
+// Convenience wrappers
+function alertDupe(offender, dupeType, itemDesc, loc, mitigation = "", messageNote = "") {
+  reportIncident(offender, dupeType, itemDesc, loc, mitigation, "attempt", messageNote);
+}
+function alertDetected(offender, incidentType, itemDesc, loc, mitigation = "", messageNote = "") {
+  reportIncident(offender, incidentType, itemDesc, loc, mitigation, "detected", messageNote);
+}
+
 // -----------------------------
-// Ghost Stack Patch
+// Ghost Stack Patch (GLOBAL CONFIG CONTROLLED)
 // -----------------------------
 world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   try {
     if (!initialSpawn || !player) return;
-    if (player.hasTag?.(DISABLE_GHOST_TAG)) return;
+
+    if (!configLoaded) loadGlobalConfig();
+    if (!globalConfig.ghostPatch) {
+      dbgOncePer("ghost_disabled", 600, "info", "ghost", "Ghost Stack Patch is disabled (config).");
+      return;
+    }
 
     const cursor = getCursorInventory(player);
     const invCont = getEntityInventoryContainer(player);
-    if (!cursor || !invCont) return;
+    if (!cursor || !invCont) {
+      dbgOncePer("ghost_missing_inv", 600, "warn", "ghost", "Ghost check skipped: missing cursor or inventory component.");
+      return;
+    }
 
     const held = cursor.item;
     const empty = invCont.emptySlotsCount;
 
     if (held && held.amount === held.maxAmount && empty === 0) {
-      player.dimension.spawnItem(new ItemStack(held.typeId, 1), player.location);
-      try { cursor.clear(); } catch {}
-      alertDupe(player, "Ghost Stack Dupe", `${held.amount}x ${held.typeId}`, player.location);
+      try {
+        player.dimension.spawnItem(new ItemStack(held.typeId, 1), player.location);
+      } catch (e) {
+        dbgWarn("ghost", `Failed to spawnItem in ghost patch: ${e}`);
+      }
+
+      try { cursor.clear(); } catch (e) {
+        dbgWarn("ghost", `Failed to clear cursor inventory: ${e}`);
+      }
+
+      alertDupe(
+        player,
+        "Ghost Stack Dupe",
+        `${held.amount}x ${held.typeId}`,
+        player.location,
+        "Cursor cleared; 1 item dropped; ghost stack prevented."
+      );
+    } else {
+      dbgOncePer("ghost_no_action", 600, "info", "ghost", "Ghost spawn check ran with no action required.");
     }
   } catch (e) {
     console.warn(`[Anti-Dupe] Ghost patch error: ${e}`);
+    dbgError("ghost", `Ghost patch error: ${e}`);
   }
 });
 
 // -----------------------------
-// Optimised Scanner (Generator)
+// Illegal Stack Size Enforcement (GLOBAL CONFIG CONTROLLED)
+// -----------------------------
+function isIllegalAmount(amount, maxAmount) {
+  if (!Number.isFinite(amount)) return true;
+  if (amount <= 0) return true; // catches "beneath 0" and 0
+  const mx = Number.isFinite(maxAmount) ? maxAmount : ILLEGAL_STACK_HARD_CAP;
+  if (amount > mx) return true;
+  if (amount > ILLEGAL_STACK_HARD_CAP) return true;
+  return false;
+}
+
+function buildIllegalSummary(list, maxParts = 5) {
+  const parts = [];
+  const shown = list.slice(0, maxParts);
+
+  for (const f of shown) {
+    parts.push(`${f.amount}x ${f.typeId} (slot ${f.slot}; max ${f.max})`);
+  }
+  if (list.length > maxParts) parts.push(`+${list.length - maxParts} more`);
+  return parts.join(", ");
+}
+
+function enforceIllegalStacksForPlayer(player) {
+  try {
+    if (!player?.location) return;
+
+    if (!configLoaded) loadGlobalConfig();
+    if (!globalConfig.illegalStackPatch) {
+      dbgOncePer("illegal_disabled", 600, "info", "illegal", "Illegal Stack Patch is disabled (config).");
+      return;
+    }
+
+    const cont = getEntityInventoryContainer(player);
+    if (!cont) {
+      dbgOncePer("illegal_missing_inv", 600, "warn", "illegal", "Illegal stack scan skipped: missing inventory component.");
+      return;
+    }
+
+    const findings = [];
+
+    // Inventory slots
+    for (let slot = 0; slot < cont.size; slot++) {
+      const stack = cont.getItem(slot);
+      if (!stack) continue;
+
+      const amt = Number(stack.amount);
+      const mx = Number(stack.maxAmount ?? ILLEGAL_STACK_HARD_CAP);
+
+      if (isIllegalAmount(amt, mx)) {
+        findings.push({ slot, typeId: stack.typeId, amount: amt, max: mx });
+        clearContainerSlot(cont, slot);
+      }
+    }
+
+    // Cursor slot (if present)
+    try {
+      const cursor = getCursorInventory(player);
+      const cItem = cursor?.item;
+      if (cItem) {
+        const amt = Number(cItem.amount);
+        const mx = Number(cItem.maxAmount ?? ILLEGAL_STACK_HARD_CAP);
+        if (isIllegalAmount(amt, mx)) {
+          findings.push({ slot: "cursor", typeId: cItem.typeId, amount: amt, max: mx });
+          try { cursor.clear(); } catch {}
+        }
+      }
+    } catch (e) {
+      dbgWarn("illegal", `Cursor scan failed: ${e}`);
+    }
+
+    if (!findings.length) return;
+
+    const summary = buildIllegalSummary(findings, 5);
+    const count = findings.length;
+
+    alertDetected(
+      player,
+      "Illegal Stack Size",
+      `${count} stack(s) removed: ${summary}`,
+      player.location,
+      "Illegal stack sizes removed from inventory."
+    );
+
+    dbgWarn("illegal", `Removed illegal stacks from ${player.nameTag ?? player.name ?? "player"}: ${summary}`);
+  } catch (e) {
+    console.warn(`[Anti-Dupe] Illegal stack enforcement failed: ${e}`);
+    dbgError("illegal", `Illegal stack enforcement failed: ${e}`);
+  }
+}
+
+system.runInterval(() => {
+  try {
+    const players = getPlayersSafe();
+    for (const p of players) enforceIllegalStacksForPlayer(p);
+  } catch (e) {
+    dbgError("illegal", `Illegal stack interval crashed: ${e}`);
+  }
+}, ILLEGAL_STACK_SCAN_TICKS);
+
+// -----------------------------
+// Optimised Scanner (Generator) - GLOBAL CONFIG CONTROLLED
 // -----------------------------
 function* mainScanner() {
+  dbgInfo("scanner", "Main scanner started.");
+
   while (true) {
     const players = getPlayersSafe();
+
+    if (!configLoaded) loadGlobalConfig();
+
+    const scanAny = !!(globalConfig.plantPatch || globalConfig.hopperPatch || globalConfig.dropperPatch);
+    if (!scanAny) {
+      dbgOncePer("scanner_disabled", 600, "info", "scanner", "Scanner loop active but all scan patches are disabled.");
+      yield "FRAME_END";
+      continue;
+    }
 
     for (const player of players) {
       try {
@@ -326,9 +1354,9 @@ function* mainScanner() {
         const by = Math.floor(cy);
         const bz = Math.floor(cz);
 
-        const checkPlant   = !player.hasTag?.(DISABLE_PLANT_TAG);
-        const checkHopper  = !player.hasTag?.(DISABLE_HOPPER_TAG);
-        const checkDropper = !player.hasTag?.(DISABLE_DROPPER_TAG);
+        const checkPlant   = !!globalConfig.plantPatch;
+        const checkHopper  = !!globalConfig.hopperPatch;
+        const checkDropper = !!globalConfig.dropperPatch;
         if (!checkPlant && !checkHopper && !checkDropper) continue;
 
         for (let dx = -SCAN_RADIUS; dx <= SCAN_RADIUS; dx++) {
@@ -355,6 +1383,7 @@ function* mainScanner() {
         }
       } catch (e) {
         console.warn(`[ERROR] Scanner crashed on player: ${e}`);
+        dbgError("scanner", `Scanner crashed on a player loop: ${e}`);
       }
     }
     yield "FRAME_END";
@@ -364,13 +1393,17 @@ function* mainScanner() {
 const scanner = mainScanner();
 
 system.runInterval(() => {
-  let ops = 0;
-  let result;
+  try {
+    let ops = 0;
+    let result;
 
-  while (ops < BLOCKS_PER_TICK_LIMIT) {
-    result = scanner.next();
-    ops++;
-    if (result?.value === "FRAME_END") break;
+    while (ops < BLOCKS_PER_TICK_LIMIT) {
+      result = scanner.next();
+      ops++;
+      if (result?.value === "FRAME_END") break;
+    }
+  } catch (e) {
+    dbgError("scanner", `Scanner interval crashed: ${e}`);
   }
 }, 1);
 
@@ -378,6 +1411,7 @@ system.runInterval(() => {
 // Patch Handlers
 // -----------------------------
 function processPlantCheck(player, dim, plantBlock, pos) {
+  // USER-FACING TYPE: "Piston Dupe"
   for (const o of PISTON_OFFSETS) {
     for (const d of [1, 2]) {
       const bx = pos.x + o.x * d;
@@ -390,7 +1424,17 @@ function processPlantCheck(player, dim, plantBlock, pos) {
         const ok = setBlockToAir(nb);
         if (ok) {
           console.warn(`[ACTION] Removed Piston at ${Math.floor(bx)}, ${Math.floor(pos.y)}, ${Math.floor(bz)}`);
-          alertDupe(player, "Plant Dupe", plantBlock.typeId, pos);
+          dbgWarn("plant", `Removed piston near two-high plant @ ${bx},${pos.y},${bz}`);
+
+          alertDupe(
+            player,
+            "Piston Dupe",
+            plantBlock.typeId,
+            pos,
+            "Nearby piston removed."
+          );
+        } else {
+          dbgError("plant", `Failed to remove piston @ ${bx},${pos.y},${bz}`);
         }
       }
     }
@@ -398,103 +1442,567 @@ function processPlantCheck(player, dim, plantBlock, pos) {
 }
 
 function processHopperCheck(player, block, pos) {
+  // USER-FACING TYPE: "Hopper Dupe"
   const inv =
     block.getComponent?.("minecraft:inventory") ??
     block.getComponent?.("inventory");
   const cont = inv?.container;
-  if (!cont) return;
+  if (!cont) {
+    dbgOncePer("hopper_no_container", 600, "warn", "hopper", "Hopper scan: missing inventory container component.");
+    return;
+  }
+
+  if (!restrictedItemsSet || restrictedItemsSet.size === 0) {
+    dbgOncePer("hopper_no_restrict", 600, "warn", "hopper", "Restricted item list is empty; hopper patch will do nothing.");
+    return;
+  }
 
   let wiped = false;
+  const removed = [];
+
   for (let slot = 0; slot < cont.size; slot++) {
     const stack = cont.getItem(slot);
     if (!stack) continue;
 
-    if (BUNDLE_TYPES.has(stack.typeId)) {
+    if (restrictedItemsSet.has(String(stack.typeId).toLowerCase())) {
+      removed.push(`${stack.amount}x ${stack.typeId}`);
       clearContainerSlot(cont, slot);
       wiped = true;
     }
   }
 
-  if (wiped) alertDupe(player, "Hopper Bundle Dupe", "Bundle", pos);
+  if (wiped) {
+    dbgWarn("hopper", `Restricted item(s) removed from hopper: ${removed.join(", ") || "unknown"}`);
+    alertDupe(
+      player,
+      "Hopper Dupe",
+      removed.length ? removed.join(", ") : "Restricted Item",
+      pos,
+      "Restricted item removed from hopper inventory."
+    );
+  }
 }
 
 function processDropperCheck(player, dim, block, pos) {
+  // USER-FACING TYPE: "Dropper Dupe" with NOTE: (Item Ejected)
   const inv =
     block.getComponent?.("minecraft:inventory") ??
     block.getComponent?.("inventory");
   const cont = inv?.container;
-  if (!cont) return;
+  if (!cont) {
+    dbgOncePer("dropper_no_container", 600, "warn", "dropper", "Dropper scan: missing inventory container component.");
+    return;
+  }
+
+  if (!restrictedItemsSet || restrictedItemsSet.size === 0) {
+    dbgOncePer("dropper_no_restrict", 600, "warn", "dropper", "Restricted item list is empty; dropper patch will do nothing.");
+    return;
+  }
 
   let wiped = false;
+  const removed = [];
+
   for (let slot = 0; slot < cont.size; slot++) {
     const stack = cont.getItem(slot);
     if (!stack) continue;
 
-    if (BUNDLE_TYPES.has(stack.typeId)) {
-      // Eject the restricted item and wipe it from the container
+    if (restrictedItemsSet.has(String(stack.typeId).toLowerCase())) {
+      removed.push(`${stack.amount}x ${stack.typeId}`);
+
       try {
         dim.spawnItem(stack, { x: pos.x + 0.5, y: pos.y + 1.2, z: pos.z + 0.5 });
-      } catch {}
+      } catch (e) {
+        dbgWarn("dropper", `spawnItem failed during ejection: ${e}`);
+      }
+
       clearContainerSlot(cont, slot);
       wiped = true;
     }
   }
 
-  if (wiped) alertDupe(player, "Restricted Item (Ejected)", "Bundle", pos);
+  if (wiped) {
+    dbgWarn("dropper", `Restricted item(s) ejected from dropper: ${removed.join(", ") || "unknown"}`);
+    alertDupe(
+      player,
+      "Dropper Dupe",
+      removed.length ? removed.join(", ") : "Restricted Item",
+      pos,
+      "Restricted item ejected and removed from dropper inventory.",
+      "(Item Ejected)"
+    );
+  }
 }
 
 // -----------------------------
 // UI Handling
 // -----------------------------
 async function ForceOpen(player, form, timeout = 1200) {
-  const start = system.currentTick;
-  while (system.currentTick - start < timeout) {
-    const response = await form.show(player);
-    if (response.cancelationReason !== "UserBusy") return response;
+  try {
+    const start = system.currentTick;
+    while (system.currentTick - start < timeout) {
+      const response = await form.show(player);
+      if (response.cancelationReason !== "UserBusy") return response;
+    }
+    dbgWarn("ui", "ForceOpen timed out (player stayed busy).");
+    return undefined;
+  } catch (e) {
+    dbgError("ui", `ForceOpen failed: ${e}`);
+    return undefined;
   }
-  return undefined;
 }
 
-function openDupeLogsMenu(player) {
-  const logEntries = [...dupeLogs].reverse();
-  const bodyText = logEntries.length ? logEntries.join("\n") : "No dupe logs.";
+// -----------------------------
+// LOGS UI
+// -----------------------------
+function openLogsMenu(player) {
+  dbgInfo("ui", "Opened Logs menu.");
 
-  const form = new MessageFormData()
-    .title("Dupe Logs")
-    .body(bodyText)
-    .button1("Close")
-    .button2("Clear Logs");
+  const form = new ActionFormData()
+    .title("Logs")
+    .button("Incident Logs")
+    .button("Violations")
+    .button("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (res && res.selection === 1) {
+    if (!res || res.canceled) return;
+    if (res.selection === 0) openIncidentLogsMenu(player);
+    else if (res.selection === 1) openViolationsDashboard(player);
+    else openMainMenu(player);
+  });
+}
+
+// Incident Logs submenu (Clear lives HERE)
+function openIncidentLogsMenu(player) {
+  const total = dupeLogs.length;
+  const recent = getMostRecentIncidentSummary();
+
+  dbgInfo("ui", "Opened Incident Logs menu.");
+
+  const form = new ActionFormData()
+    .title("Incident Logs")
+    .body(`Total Incidents: ${total}\nMost Recent: ${recent}`)
+    .button("View Logs")
+    .button("Clear Logs")
+    .button("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+
+    if (res.selection === 0) openIncidentLogViewer(player);
+    else if (res.selection === 1) confirmClearIncidentLogs(player);
+    else openLogsMenu(player);
+  });
+}
+
+function openIncidentLogViewer(player) {
+  dbgInfo("ui", "Opened Incident Log Viewer.");
+
+  const bodyText = formatIncidentLogsText(25);
+
+  const form = new MessageFormData()
+    .title("Incident Logs")
+    .body(bodyText)
+    .button1("Close")
+    .button2("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 1) openIncidentLogsMenu(player);
+  });
+}
+
+function confirmClearIncidentLogs(player) {
+  dbgWarn("ui", "Opened Clear Incident Logs confirmation.");
+
+  const form = new MessageFormData()
+    .title("Clear Incident Logs")
+    .body("This will permanently delete all incident log entries.\n\nProceed?")
+    .button1("Cancel")
+    .button2("Clear");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 1) {
       dupeLogs = [];
       queueSaveLogs();
-      try { player.sendMessage("§aLogs Cleared."); } catch {}
+      try { player.sendMessage("§aIncident logs cleared."); } catch {}
+      dbgWarn("logs", "Incident logs cleared by admin.");
+      openIncidentLogsMenu(player);
     }
   });
 }
 
-function openSettingsForm(player) {
-  // IMPORTANT: Use options objects with defaultValue (prevents native type conversion errors)
+// -----------------------------
+// VIOLATIONS UI
+// -----------------------------
+function openViolationsDashboard(player) {
+  if (!vioStatsLoaded) loadVioStats();
+  ensureViolationObjectives();
+
+  dbgInfo("ui", "Opened Violations dashboard.");
+
+  const { key: mostKey, count: mostCount } = getMostUsedViolationType();
+  const mr = vioStats?.mostRecent ?? { t: "", player: "", type: "" };
+
+  const globalCount = Number.isFinite(vioStats.globalCount) ? vioStats.globalCount : 0;
+  const { rows, note } = getViolationsTable();
+
+  const lines = [];
+  lines.push("§lViolation Dashboard§r");
+  lines.push("");
+  lines.push(`§7Global Violation Count:§r §e${globalCount}§r`);
+  lines.push(`§7Most Recent Violation:§r ${mr.player ? `§f${mr.player}§r §7—§r §f${mr.type}§r` : "§8None§r"}`);
+  lines.push(`§7Most Used Violation:§r ${mostKey !== "None" ? `§f${prettyTypeKey(mostKey)}§r §7(${mostCount})§r` : "§8None§r"}`);
+  lines.push("");
+
+  const tc = vioStats.typeCounts ?? {};
+  lines.push("§lType Totals§r");
+  lines.push(`§7Ghost:§r ${tc.ghost ?? 0}  §7Piston:§r ${tc.plant ?? 0}  §7Hopper:§r ${tc.hopper ?? 0}  §7Dropper:§r ${tc.dropper ?? 0}  §7Other:§r ${tc.other ?? 0}`);
+  lines.push("");
+
+  if (note) {
+    lines.push(`§8${note}§r`);
+    lines.push("");
+  }
+
+  lines.push("§lPlayers with Violations§r");
+  if (!rows.length) {
+    lines.push("§8None§r");
+  } else {
+    const cap = 40;
+    const shown = rows.slice(0, cap);
+    let idx = 1;
+
+    for (const r of shown) {
+      lines.push(
+        `${idx}) §f${r.name}§r — §e${r.total}§r ` +
+        `§7(G:${r.ghost} P:${r.plant} H:${r.hopper} D:${r.dropper} O:${r.other})§r`
+      );
+      idx++;
+    }
+
+    if (rows.length > cap) {
+      lines.push("");
+      lines.push(`§8...and ${rows.length - cap} more§r`);
+    }
+  }
+
+  const form = new MessageFormData()
+    .title("Violations")
+    .body(lines.join("\n"))
+    .button1("Close")
+    .button2("Refresh");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 1) openViolationsDashboard(player);
+  });
+}
+
+// -----------------------------
+// SETTINGS UI (Configuration + Restricted Items + Personal Settings)
+// -----------------------------
+function openSettingsMenu(player) {
+  dbgInfo("ui", "Opened Settings menu.");
+
+  const form = new ActionFormData()
+    .title("Settings")
+    .button("Configuration")
+    .button("Restricted Items")
+    .button("Personal Settings")
+    .button("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 0) openConfigurationForm(player);
+    else if (res.selection === 1) openRestrictedItemsMenu(player);
+    else if (res.selection === 2) openPersonalSettingsForm(player);
+    else openMainMenu(player);
+  });
+}
+
+function openConfigurationForm(player) {
+  if (!configLoaded) loadGlobalConfig();
+
+  dbgInfo("ui", "Opened Configuration form.");
+
   const form = new ModalFormData()
-    .title("Anti-Dupe Config")
-    .toggle("Ghost Stack Patch",    { defaultValue: !player.hasTag?.(DISABLE_GHOST_TAG) })
-    .toggle("Plant Dupe Patch",     { defaultValue: !player.hasTag?.(DISABLE_PLANT_TAG) })
-    .toggle("Hopper Bundle Patch",  { defaultValue: !player.hasTag?.(DISABLE_HOPPER_TAG) })
-    .toggle("Dropper Bundle Patch", { defaultValue: !player.hasTag?.(DISABLE_DROPPER_TAG) })
-    .toggle("Coordinate Alerts",    { defaultValue: !player.hasTag?.(DISABLE_ALERT_TAG) })
-    .toggle("Public Messages",      { defaultValue: !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG) })
-    .toggle("Admin Messages",       { defaultValue: !player.hasTag?.(DISABLE_ADMIN_MSG_TAG) });
+    .title("Configuration (World)")
+    .toggle("Ghost Stack Patch",    !!globalConfig.ghostPatch)
+    .toggle("Piston Dupe Patch",    !!globalConfig.plantPatch)
+    .toggle("Hopper Dupe Patch",    !!globalConfig.hopperPatch)
+    .toggle("Dropper Dupe Patch",   !!globalConfig.dropperPatch)
+    .toggle("Illegal Stack Patch",  !!globalConfig.illegalStackPatch);
 
   ForceOpen(player, form).then((response) => {
     if (!response || response.canceled) return;
 
-    const tags = [
-      DISABLE_GHOST_TAG, DISABLE_PLANT_TAG, DISABLE_HOPPER_TAG, DISABLE_DROPPER_TAG,
-      DISABLE_ALERT_TAG, DISABLE_PUBLIC_MSG_TAG, DISABLE_ADMIN_MSG_TAG
-    ];
+    const v = response.formValues ?? [];
+    globalConfig = normalizeConfig({
+      ...globalConfig,
+      ghostPatch:        !!v[0],
+      plantPatch:        !!v[1],
+      hopperPatch:       !!v[2],
+      dropperPatch:      !!v[3],
+      illegalStackPatch: !!v[4],
+      restrictedItems:   globalConfig.restrictedItems,
+    });
 
-    response.formValues.forEach((enabled, i) => {
+    rebuildRestrictedItemsSet();
+    queueSaveGlobalConfig();
+    dbgWarn("config", "World configuration toggles updated via UI.");
+
+    try { player.sendMessage("§aWorld configuration updated."); } catch {}
+    openSettingsMenu(player);
+  });
+}
+
+function formatRestrictedItemsList(maxLines = 20) {
+  const items = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems : [];
+  if (!items.length) return "None";
+
+  const shown = items.slice(0, maxLines);
+  let out = shown.map((v, i) => `${i + 1}) ${v}`).join("\n");
+  if (items.length > maxLines) out += `\n\n...and ${items.length - maxLines} more`;
+  return out;
+}
+
+// -----------------------------
+// RESTRICTED ITEMS UI (MISSING)
+// -----------------------------
+function openRestrictedItemsMenu(player) {
+  if (!configLoaded) loadGlobalConfig();
+
+  const count = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.length : 0;
+  const preview = formatRestrictedItemsList(12);
+
+  dbgInfo("ui", "Opened Restricted Items menu.");
+
+  const form = new ActionFormData()
+    .title("Restricted Items (World)")
+    .body(`Count: ${count}\n\nPreview:\n${preview}`)
+    .button("View Full List")
+    .button("Add Item")
+    .button("Remove Item")
+    .button("Reset to Defaults")
+    .button("Back");
+
+  ForceOpen(player, form)
+    .then((res) => {
+      if (!res || res.canceled) return;
+
+      if (res.selection === 0) openRestrictedItemsViewer(player);
+      else if (res.selection === 1) openAddRestrictedItemForm(player);
+      else if (res.selection === 2) openRemoveRestrictedItemForm(player);
+      else if (res.selection === 3) confirmResetRestrictedItems(player);
+      else openSettingsMenu(player);
+    })
+    .catch((e) => dbgError("ui", `Restricted Items menu crashed: ${e}`));
+}
+
+function openRestrictedItemsViewer(player) {
+  if (!configLoaded) loadGlobalConfig();
+
+  dbgInfo("ui", "Opened Restricted Items viewer.");
+
+  const body = formatRestrictedItemsList(80);
+
+  const form = new MessageFormData()
+    .title("Restricted Items")
+    .body(body)
+    .button1("Close")
+    .button2("Back");
+
+  ForceOpen(player, form)
+    .then((res) => {
+      if (!res || res.canceled) return;
+      if (res.selection === 1) openRestrictedItemsMenu(player);
+    })
+    .catch((e) => dbgError("ui", `Restricted Items viewer crashed: ${e}`));
+}
+
+
+// -----------------------------
+// UI Compat: ModalFormData.textField signature changed across versions
+// - Older: textField(label, placeholder?, defaultValue?)
+// - Newer: textField(label, placeholder?, options?: ModalFormDataTextFieldOptions)
+// This wrapper prevents native type conversion errors.
+// -----------------------------
+
+function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
+  // Most compatible: 2 args (works on modern + legacy)
+  try {
+    form.textField(label, placeholder);
+    return form;
+  } catch (e2) {
+    // Newer overload: options object
+    try {
+      form.textField(label, placeholder, { defaultValue: String(defaultValue ?? "") });
+      return form;
+    } catch (e3) {
+      // Legacy overload: defaultValue string
+      try {
+        form.textField(label, placeholder, String(defaultValue ?? ""));
+        return form;
+      } catch (e4) {
+        dbgError("ui", `textField attach failed: ${e2} | ${e3} | ${e4}`);
+        return form;
+      }
+    }
+  }
+}
+
+
+
+function openAddRestrictedItemForm(player) {
+  dbgInfo("ui", "Opened Add Restricted Item form.");
+
+  const form = new ModalFormData().title("Add Restricted Item");
+  addTextFieldCompat(form, "Enter item id (namespace:item)", "minecraft:bundle", "");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+
+    const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
+    if (!raw) {
+      dbgWarn("restrict", "Add restricted item: empty input.");
+      try { player.sendMessage("§cInvalid input: empty item id."); } catch {}
+      return openRestrictedItemsMenu(player);
+    }
+
+    if (!isValidNamespacedId(raw)) {
+      dbgWarn("restrict", `Add restricted item: invalid id format: ${raw}`);
+      try { player.sendMessage("§cInvalid item id. Use namespace:item (e.g., minecraft:bundle)."); } catch {}
+      return openRestrictedItemsMenu(player);
+    }
+
+    const list = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.slice() : [];
+    if (list.includes(raw)) {
+      dbgInfo("restrict", `Add restricted item: already exists: ${raw}`);
+      try { player.sendMessage("§eThat item is already restricted."); } catch {}
+      return openRestrictedItemsMenu(player);
+    }
+
+    if (list.length >= MAX_RESTRICTED_ITEMS) {
+      dbgWarn("restrict", `Add restricted item denied (max reached): ${MAX_RESTRICTED_ITEMS}`);
+      try { player.sendMessage(`§cRestricted list full (max ${MAX_RESTRICTED_ITEMS}). Remove an item first.`); } catch {}
+      return openRestrictedItemsMenu(player);
+    }
+
+    list.push(raw);
+
+    globalConfig = normalizeConfig({
+      ...globalConfig,
+      restrictedItems: list,
+    });
+
+    rebuildRestrictedItemsSet();
+    queueSaveGlobalConfig();
+
+    dbgWarn("restrict", `Added restricted item: ${raw}`);
+    try { player.sendMessage(`§aAdded restricted item: §f${raw}`); } catch {}
+
+    openRestrictedItemsMenu(player);
+  });
+}
+
+
+function openRemoveRestrictedItemForm(player) {
+  dbgInfo("ui", "Opened Remove Restricted Item form.");
+
+  const preview = formatRestrictedItemsList(10);
+  const form = new ModalFormData().title("Remove Restricted Item");
+
+  addTextFieldCompat(
+    form,
+    `Enter item id to remove\n\nPreview:\n${preview}`,
+    "minecraft:bundle",
+    ""
+  );
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+
+    const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
+    if (!raw) {
+      dbgWarn("restrict", "Remove restricted item: empty input.");
+      try { player.sendMessage("§cInvalid input: empty item id."); } catch {}
+      return openRestrictedItemsMenu(player);
+    }
+
+    const list = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.slice() : [];
+    const idx = list.indexOf(raw);
+
+    if (idx === -1) {
+      dbgInfo("restrict", `Remove restricted item: not found: ${raw}`);
+      try { player.sendMessage("§eThat item is not currently restricted."); } catch {}
+      return openRestrictedItemsMenu(player);
+    }
+
+    list.splice(idx, 1);
+
+    globalConfig = normalizeConfig({
+      ...globalConfig,
+      restrictedItems: list,
+    });
+
+    rebuildRestrictedItemsSet();
+    queueSaveGlobalConfig();
+
+    dbgWarn("restrict", `Removed restricted item: ${raw}`);
+    try { player.sendMessage(`§aRemoved restricted item: §f${raw}`); } catch {}
+
+    openRestrictedItemsMenu(player);
+  });
+}
+
+
+function confirmResetRestrictedItems(player) {
+  dbgWarn("ui", "Opened Restricted Items reset confirmation.");
+
+  const form = new MessageFormData()
+    .title("Reset Restricted Items")
+    .body("This will reset the restricted item list to defaults (bundles).\n\nProceed?")
+    .button1("Cancel")
+    .button2("Reset");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+
+    if (res.selection === 1) {
+      globalConfig = normalizeConfig({
+        ...globalConfig,
+        restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(),
+      });
+
+      rebuildRestrictedItemsSet();
+      queueSaveGlobalConfig();
+
+      dbgWarn("restrict", "Restricted item list reset to defaults.");
+      try { player.sendMessage("§aRestricted items reset to defaults."); } catch {}
+
+      openRestrictedItemsMenu(player);
+    } else {
+      openRestrictedItemsMenu(player);
+    }
+  });
+}
+
+function openPersonalSettingsForm(player) {
+  dbgInfo("ui", "Opened Personal Settings form.");
+
+  const form = new ModalFormData()
+    .title("Personal Settings (Admin)")
+    .toggle("Public Messages",       !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG))
+    .toggle("Admin Messages",        !player.hasTag?.(DISABLE_ADMIN_MSG_TAG))
+    .toggle("Admin Alerts (Coords)", !player.hasTag?.(DISABLE_ALERT_TAG));
+
+  ForceOpen(player, form).then((response) => {
+    if (!response || response.canceled) return;
+
+    const tags = [DISABLE_PUBLIC_MSG_TAG, DISABLE_ADMIN_MSG_TAG, DISABLE_ALERT_TAG];
+
+    (response.formValues ?? []).forEach((enabled, i) => {
       const tag = tags[i];
       if (!tag) return;
 
@@ -505,44 +2013,210 @@ function openSettingsForm(player) {
       }
     });
 
-    try { player.sendMessage("§aSettings Updated."); } catch {}
+    dbgInfo("ui", "Personal settings updated (tags toggled).");
+    try { player.sendMessage("§aPersonal settings updated."); } catch {}
+    openSettingsMenu(player);
   });
 }
 
-// Menu Activation (Admin holds SETTINGS_ITEM)
-world.beforeEvents.itemUse.subscribe((event) => {
-  const source = event.source;
-  const itemStack = event.itemStack;
+// -----------------------------
+// DEBUG UI (Runtime Only)
+// -----------------------------
+function formatDebugEntry(e) {
+  const lvl = (e?.lvl ?? "info").toUpperCase();
+  const area = e?.area ?? "core";
+  const msg = e?.msg ?? "";
+  const t = e?.t ?? "";
+  const tick = Number.isFinite(e?.tick) ? e.tick : "?";
+  return `[${lvl}] [${area}] tick=${tick} | ${t}\n${msg}`;
+}
 
-  if (!source?.hasTag?.(ADMIN_TAG)) return;
-  if (!itemStack || itemStack.typeId !== SETTINGS_ITEM) return;
+function formatDebugLogText(maxEntries = 50) {
+  const total = debugLog.length;
+  if (!total) return "No debug entries (runtime).";
 
-  event.cancel = true;
+  const newestFirst = [...debugLog].reverse().slice(0, maxEntries);
+  const blocks = newestFirst.map(formatDebugEntry);
 
-  system.run(() => {
-    const menu = new ActionFormData()
-      .title("Anti-Dupe")
-      .button("Settings")
-      .button("Logs");
+  let out = `Debug Log (${Math.min(total, maxEntries)}/${total} shown)\n\n`;
+  out += blocks.join("\n\n---\n\n");
 
-    ForceOpen(source, menu).then((res) => {
-      if (!res || res.canceled) return;
-      res.selection === 0 ? openSettingsForm(source) : openDupeLogsMenu(source);
-    });
+  if (total > maxEntries) out += `\n\n---\n\nNote: ${total - maxEntries} older entries not shown.`;
+  return out;
+}
+
+function getRuntimeStatusText() {
+  if (!configLoaded) loadGlobalConfig();
+
+  const scanAny = !!(globalConfig.plantPatch || globalConfig.hopperPatch || globalConfig.dropperPatch);
+  const restrictedCount = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.length : 0;
+
+  const lines = [];
+  lines.push("Runtime Status");
+  lines.push("");
+  lines.push(`Tick: ${system.currentTick}`);
+  lines.push(`Persistence Enabled: ${persistenceEnabled}`);
+  lines.push(`Config Loaded: ${configLoaded}`);
+  lines.push(`Logs Loaded: ${logsLoaded}`);
+  lines.push(`Violations Loaded: ${vioStatsLoaded}`);
+  lines.push(`Violation Objectives Ready: ${vioObjectivesReady}`);
+  lines.push(`Scoreboard Available: ${!!world.scoreboard}`);
+  lines.push("");
+  lines.push("Patches:");
+  lines.push(`- Ghost Stack Patch: ${!!globalConfig.ghostPatch}`);
+  lines.push(`- Piston Dupe Patch: ${!!globalConfig.plantPatch}`);
+  lines.push(`- Hopper Dupe Patch: ${!!globalConfig.hopperPatch}`);
+  lines.push(`- Dropper Dupe Patch: ${!!globalConfig.dropperPatch}`);
+  lines.push(`- Illegal Stack Patch: ${!!globalConfig.illegalStackPatch}`);
+  lines.push("");
+  lines.push(`Scanner Enabled (any): ${scanAny}`);
+  lines.push(`Restricted Item Count: ${restrictedCount} (set size=${restrictedItemsSet?.size ?? 0})`);
+  lines.push("");
+  lines.push("Debug Counters (runtime):");
+  lines.push(`- Info: ${debugCounters.info}`);
+  lines.push(`- Warn: ${debugCounters.warn}`);
+  lines.push(`- Error: ${debugCounters.error}`);
+  lines.push(`- Stored Entries: ${debugLog.length}/${DEBUG_LOG_MAX}`);
+
+  return lines.join("\n");
+}
+
+function openDebugMenu(player) {
+  dbgInfo("ui", "Opened Debug menu.");
+
+  const last = debugLog.length ? debugLog[debugLog.length - 1] : null;
+  const lastLine = last ? `[${String(last.lvl).toUpperCase()}] ${last.area}: ${last.msg}` : "None";
+
+  const body =
+    `Entries: ${debugLog.length}/${DEBUG_LOG_MAX}\n` +
+    `Errors: ${debugCounters.error} | Warnings: ${debugCounters.warn} | Info: ${debugCounters.info}\n\n` +
+    `Most Recent:\n${lastLine}`;
+
+  const form = new ActionFormData()
+    .title("Debug (Runtime)")
+    .body(body)
+    .button("View Debug Log")
+    .button("Runtime Status")
+    .button("Clear Debug Log")
+    .button("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+
+    if (res.selection === 0) openDebugViewer(player);
+    else if (res.selection === 1) openRuntimeStatusViewer(player);
+    else if (res.selection === 2) confirmClearDebugLog(player);
+    else openMainMenu(player);
   });
+}
+
+function openDebugViewer(player) {
+  const body = formatDebugLogText(60);
+
+  const form = new MessageFormData()
+    .title("Debug Log")
+    .body(body)
+    .button1("Close")
+    .button2("Refresh");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 1) openDebugViewer(player);
+  });
+}
+
+function openRuntimeStatusViewer(player) {
+  const body = getRuntimeStatusText();
+
+  const form = new MessageFormData()
+    .title("Runtime Status")
+    .body(body)
+    .button1("Close")
+    .button2("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 1) openDebugMenu(player);
+  });
+}
+
+function confirmClearDebugLog(player) {
+  const form = new MessageFormData()
+    .title("Clear Debug Log")
+    .body("This will clear runtime debug entries (not persistent).\n\nProceed?")
+    .button1("Cancel")
+    .button2("Clear");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+
+    if (res.selection === 1) {
+      debugLog = [];
+      debugCounters = { info: 0, warn: 0, error: 0 };
+      debugLastByKey = Object.create(null);
+      dbgWarn("debug", "Debug log cleared by admin.");
+      try { player.sendMessage("§aDebug log cleared."); } catch {}
+    }
+    openDebugMenu(player);
+  });
+}
+
+// -----------------------------
+// MAIN MENU (Settings / Logs / Debug)
+// -----------------------------
+function openMainMenu(player) {
+  dbgInfo("ui", "Opened Main menu.");
+
+  const menu = new ActionFormData()
+    .title("Anti-Dupe")
+    .button("Settings")
+    .button("Logs")
+    .button("Debug");
+
+  ForceOpen(player, menu).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 0) openSettingsMenu(player);
+    else if (res.selection === 1) openLogsMenu(player);
+    else openDebugMenu(player);
+  });
+}
+
+// -----------------------------
+// Menu Activation (Admin holds SETTINGS_ITEM)
+// -----------------------------
+world.beforeEvents.itemUse.subscribe((event) => {
+  try {
+    const source = event.source;
+    const itemStack = event.itemStack;
+
+    if (!source?.hasTag?.(ADMIN_TAG)) return;
+    if (!itemStack || itemStack.typeId !== SETTINGS_ITEM) return;
+
+    event.cancel = true;
+
+    system.run(() => {
+      openMainMenu(source);
+    });
+  } catch (e) {
+    dbgError("ui", `itemUse menu open failed: ${e}`);
+  }
 });
 
-// Optional log viewer via block hit (mining triggers this too — safe guarded)
+// Optional menu open via block hit (mining triggers this too — safe guarded)
 world.afterEvents.entityHitBlock.subscribe((event) => {
-  const p = event.damagingEntity;
-  if (!p || p.typeId !== "minecraft:player") return;
-  if (!p.hasTag?.(ADMIN_TAG)) return;
+  try {
+    const p = event.damagingEntity;
+    if (!p || p.typeId !== "minecraft:player") return;
+    if (!p.hasTag?.(ADMIN_TAG)) return;
 
-  const cont = getEntityInventoryContainer(p);
-  if (!cont || cont.size <= 0) return;
+    const cont = getEntityInventoryContainer(p);
+    if (!cont || cont.size <= 0) return;
 
-  const slot = getSelectedSlotSafe(p, cont.size);
-  const item = cont.getItem(slot);
+    const slot = getSelectedSlotSafe(p, cont.size);
+    const item = cont.getItem(slot);
 
-  if (item?.typeId === SETTINGS_ITEM) openDupeLogsMenu(p);
+    if (item?.typeId === SETTINGS_ITEM) openMainMenu(p);
+  } catch (e) {
+    dbgWarn("ui", `entityHitBlock handler failed: ${e}`);
+  }
 });
