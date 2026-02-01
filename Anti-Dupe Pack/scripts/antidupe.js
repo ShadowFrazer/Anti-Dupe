@@ -1,4 +1,6 @@
-import { world, system, ItemStack, DynamicPropertiesDefinition } from "@minecraft/server";
+// Anti-Dupe
+
+import { world, system, ItemStack } from "@minecraft/server";
 import { ModalFormData, MessageFormData, ActionFormData } from "@minecraft/server-ui";
 
 const SCAN_RADIUS = 4;
@@ -15,11 +17,11 @@ const DISABLE_ALERT_TAG      = "antidupe:disable_alert";
 const DISABLE_PUBLIC_MSG_TAG = "antidupe:disable_public_msg";
 const DISABLE_ADMIN_MSG_TAG  = "antidupe:disable_admin_msg";
 
-// --- PERSISTED LOG CONFIG ---
-const DUPE_LOGS_DYN_ID = "antidupe:logs";
-// Keep this conservative to avoid platform/version edge cases.
-// (String dynamic properties are defined with an explicit max length.) :contentReference[oaicite:2]{index=2}
-const DUPE_LOGS_DYN_MAX = 32767;
+// --- PERSISTED LOG CONFIG (World Dynamic Property) ---
+const DUPE_LOGS_KEY = "antidupe:logs";
+// Conservative size cap to avoid dynamic property size/version edge cases.
+// We always trim old entries until serialized JSON fits.
+const DUPE_LOGS_MAX_CHARS = 12000;
 
 // --- SETS & DATA ---
 const TWO_HIGH = new Set([
@@ -43,25 +45,125 @@ const PISTON_OFFSETS = [
   { x:  1, z:  1 }, { x: -1, z:  1 }, { x:  1, z: -1 }, { x: -1, z: -1 },
 ];
 
-// --- LOGGING SYSTEM (persisted) ---
+// -----------------------------
+// Helpers (compat + safety)
+// -----------------------------
+function getPlayersSafe() {
+  try {
+    if (typeof world.getAllPlayers === "function") return world.getAllPlayers();
+    if (typeof world.getPlayers === "function") return world.getPlayers();
+  } catch {}
+  return [];
+}
+
+function runLater(fn, ticks = 0) {
+  try {
+    if (typeof system.runTimeout === "function") return system.runTimeout(fn, ticks);
+  } catch {}
+  // Fallback: immediate next tick at best
+  try { return system.run(fn); } catch {}
+}
+
+function getEntityInventoryContainer(entity) {
+  try {
+    const inv =
+      entity?.getComponent?.("minecraft:inventory") ??
+      entity?.getComponent?.("inventory");
+    return inv?.container ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function getCursorInventory(entity) {
+  try {
+    return (
+      entity?.getComponent?.("minecraft:cursor_inventory") ??
+      entity?.getComponent?.("cursor_inventory")
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function clearContainerSlot(container, slot) {
+  try { container.setItem(slot, undefined); return; } catch {}
+  try { container.setItem(slot, null); return; } catch {}
+}
+
+function setBlockToAir(block) {
+  // Prefer fast API call if present
+  try {
+    if (typeof block.setType === "function") {
+      block.setType("minecraft:air");
+      return true;
+    }
+  } catch {}
+
+  // Command fallback (slower, but keeps patch working across API differences)
+  try {
+    const dim = block.dimension;
+    const l = block.location;
+    const x = Math.floor(l.x), y = Math.floor(l.y), z = Math.floor(l.z);
+    if (typeof dim.runCommandAsync === "function") {
+      dim.runCommandAsync(`setblock ${x} ${y} ${z} air`);
+      return true;
+    }
+    if (typeof dim.runCommand === "function") {
+      dim.runCommand(`setblock ${x} ${y} ${z} air`);
+      return true;
+    }
+  } catch {}
+
+  return false;
+}
+
+// --- SAFE SLOT GETTER (prevents "Expected type: number") ---
+function getSelectedSlotSafe(player, containerSize) {
+  const raw = player?.selectedSlot;
+  let slot = (typeof raw === "number" && Number.isFinite(raw)) ? raw : 0;
+  if (typeof containerSize === "number" && containerSize > 0) {
+    if (slot < 0) slot = 0;
+    if (slot >= containerSize) slot = containerSize - 1;
+  }
+  return slot;
+}
+
+// -----------------------------
+// Persistent Dupe Logs (Option A)
+// -----------------------------
 let dupeLogs = [];
-let dynPropsReady = false;
+let logsLoaded = false;
+let logsDirty = false;
+let saveQueued = false;
+
+const persistenceEnabled =
+  typeof world.getDynamicProperty === "function" &&
+  typeof world.setDynamicProperty === "function";
 
 function safeStringifyLogs(arr) {
-  // Keep trimming oldest until it fits.
-  // This prevents setDynamicProperty failures due to maxLength.
+  // Trim oldest until JSON fits.
   while (true) {
-    const raw = JSON.stringify(arr);
-    if (raw.length <= DUPE_LOGS_DYN_MAX) return raw;
+    let raw;
+    try { raw = JSON.stringify(arr); } catch { raw = "[]"; }
+    if (raw.length <= DUPE_LOGS_MAX_CHARS) return raw;
     if (arr.length === 0) return "[]";
     arr.shift();
   }
 }
 
-function loadDupeLogsFromWorld() {
-  if (!dynPropsReady) return;
+function loadLogs() {
+  if (logsLoaded) return;
+  logsLoaded = true;
+
+  if (!persistenceEnabled) {
+    // No persistence available in this runtime — keep memory-only logs.
+    dupeLogs = [];
+    return;
+  }
+
   try {
-    const raw = world.getDynamicProperty(DUPE_LOGS_DYN_ID);
+    const raw = world.getDynamicProperty(DUPE_LOGS_KEY);
     if (typeof raw !== "string" || raw.length === 0) {
       dupeLogs = [];
       return;
@@ -69,63 +171,58 @@ function loadDupeLogsFromWorld() {
     const parsed = JSON.parse(raw);
     dupeLogs = Array.isArray(parsed) ? parsed : [];
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load persisted dupe logs: ${e}`);
+    console.warn(`[Anti-Dupe] Failed to load logs: ${e}`);
     dupeLogs = [];
   }
 }
 
-let savePending = false;
-function scheduleSaveDupeLogs() {
-  if (!dynPropsReady) return;
-  if (savePending) return;
-  savePending = true;
+function saveLogsNow() {
+  if (!persistenceEnabled) return;
+  if (!logsDirty) return;
 
-  // Debounce saves to reduce write frequency
-  system.runTimeout(() => {
-    savePending = false;
-    saveDupeLogsNow();
-  }, 40); // ~2 seconds
-}
-
-function saveDupeLogsNow() {
-  if (!dynPropsReady) return;
   try {
     const raw = safeStringifyLogs(dupeLogs);
-    world.setDynamicProperty(DUPE_LOGS_DYN_ID, raw);
+    world.setDynamicProperty(DUPE_LOGS_KEY, raw);
+    logsDirty = false;
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save persisted dupe logs: ${e}`);
+    console.warn(`[Anti-Dupe] Failed to save logs: ${e}`);
   }
 }
 
-// Register the world dynamic property + load logs once world is initializing.
-// Dynamic properties must be registered using the property registry in worldInitialize. :contentReference[oaicite:3]{index=3}
-world.afterEvents.worldInitialize.subscribe((ev) => {
-  try {
-    const def = new DynamicPropertiesDefinition();
-    def.defineString(DUPE_LOGS_DYN_ID, DUPE_LOGS_DYN_MAX);
-    ev.propertyRegistry.registerWorldDynamicProperties(def);
+function queueSaveLogs() {
+  logsDirty = true;
+  if (!persistenceEnabled) return;
+  if (saveQueued) return;
 
-    dynPropsReady = true;
-
-    // Defer actual access until the world is out of early-execution edge cases. :contentReference[oaicite:4]{index=4}
-    system.run(() => loadDupeLogsFromWorld());
-  } catch (e) {
-    console.warn(`[Anti-Dupe] Dynamic property registration failed: ${e}`);
-    dynPropsReady = false;
-  }
-});
+  saveQueued = true;
+  runLater(() => {
+    saveQueued = false;
+    saveLogsNow();
+  }, 40); // ~2 seconds (debounce)
+}
 
 function addDupeLog(entry) {
   dupeLogs.push(entry);
   if (dupeLogs.length > 100) dupeLogs.shift();
-  scheduleSaveDupeLogs();
+  queueSaveLogs();
 }
 
-/**
- * Lightweight nearby-player collector used only during alerts.
- */
+// Load logs as early as possible (next tick), and also on worldInitialize if present.
+runLater(loadLogs, 1);
+try {
+  world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadLogs, 1));
+} catch {}
+
+// Periodic flush in case the server closes before debounce fires
+system.runInterval(() => {
+  try { saveLogsNow(); } catch {}
+}, 200); // every 10 seconds
+
+// -----------------------------
+// Nearby players helper (used in alerts)
+// -----------------------------
 function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
-  const players = world.getAllPlayers?.() ?? world.getPlayers?.() ?? [];
+  const players = getPlayersSafe();
   const nearby = [];
   const r2 = radius * radius;
 
@@ -148,36 +245,76 @@ function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
   return nearby;
 }
 
-// --- GHOST STACK PATCH ---
+// -----------------------------
+// Alerts
+// -----------------------------
+function sendAdminAlert(message) {
+  const admins = getPlayersSafe().filter((p) => p?.hasTag?.(ADMIN_TAG));
+  for (const admin of admins) {
+    if (admin.hasTag?.(DISABLE_ADMIN_MSG_TAG) || admin.hasTag?.(DISABLE_ALERT_TAG)) continue;
+    try { admin.sendMessage(message); } catch {}
+  }
+}
+
+function alertDupe(offender, dupeType, itemDesc, loc) {
+  // Hardening: alerts must never crash scanner
+  try {
+    if (!offender || !loc) return;
+
+    const coordStr = `${Math.floor(loc.x)}, ${Math.floor(loc.y)}, ${Math.floor(loc.z)}`;
+    const nearby   = getNearbyPlayers(offender, loc, 50, 12);
+    const nearList = nearby.length > 0 ? nearby.join(", ") : "None";
+
+    const name = offender.nameTag ?? offender.name ?? "Unknown";
+    const broadcastMsg = `§c<Anti-Dupe> §f§l${name}§r §7attempted a ${dupeType} with §f${itemDesc}§r.`;
+    const adminMsg = `§c<Anti-Dupe> §6Admin Alert: §f§l${name}§r §7attempted a ${dupeType} with §f${itemDesc}§r at §e§l${coordStr}§r.\n§7Nearby: §e${nearList}§r.`;
+
+    // Timestamp without depending on locale formatting
+    const stamp = new Date().toISOString();
+    addDupeLog(`${stamp} | ${name} | ${dupeType} | ${itemDesc} | ${coordStr} | nearby: ${nearList}`);
+
+    for (const p of getPlayersSafe()) {
+      if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+        try { p.sendMessage(broadcastMsg); } catch {}
+      }
+    }
+    sendAdminAlert(adminMsg);
+  } catch (e) {
+    console.warn(`[Anti-Dupe] alertDupe failed: ${e}`);
+  }
+}
+
+// -----------------------------
+// Ghost Stack Patch
+// -----------------------------
 world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
-  if (!initialSpawn || !player) return;
-  if (player.hasTag?.(DISABLE_GHOST_TAG)) return;
+  try {
+    if (!initialSpawn || !player) return;
+    if (player.hasTag?.(DISABLE_GHOST_TAG)) return;
 
-  const cursor =
-    player.getComponent?.("cursor_inventory") ??
-    player.getComponent?.("minecraft:cursor_inventory");
-  const invComp =
-    player.getComponent?.("inventory") ??
-    player.getComponent?.("minecraft:inventory");
+    const cursor = getCursorInventory(player);
+    const invCont = getEntityInventoryContainer(player);
+    if (!cursor || !invCont) return;
 
-  if (!cursor || !invComp?.container) return;
+    const held = cursor.item;
+    const empty = invCont.emptySlotsCount;
 
-  const held = cursor.item;
-  const empty = invComp.container.emptySlotsCount;
-
-  if (held && held.amount === held.maxAmount && empty === 0) {
-    player.dimension.spawnItem(new ItemStack(held.typeId, 1), player.location);
-    cursor.clear();
-    alertDupe(player, "Ghost Stack Dupe", `${held.amount}x ${held.typeId}`, player.location);
+    if (held && held.amount === held.maxAmount && empty === 0) {
+      player.dimension.spawnItem(new ItemStack(held.typeId, 1), player.location);
+      try { cursor.clear(); } catch {}
+      alertDupe(player, "Ghost Stack Dupe", `${held.amount}x ${held.typeId}`, player.location);
+    }
+  } catch (e) {
+    console.warn(`[Anti-Dupe] Ghost patch error: ${e}`);
   }
 });
 
-/**
- * MAIN SCANNER LOOP (GENERATOR) MADE BY EAGLES.
- */
+// -----------------------------
+// Optimised Scanner (Generator)
+// -----------------------------
 function* mainScanner() {
   while (true) {
-    const players = world.getAllPlayers?.() ?? world.getPlayers?.() ?? [];
+    const players = getPlayersSafe();
 
     for (const player of players) {
       try {
@@ -192,33 +329,32 @@ function* mainScanner() {
         const checkPlant   = !player.hasTag?.(DISABLE_PLANT_TAG);
         const checkHopper  = !player.hasTag?.(DISABLE_HOPPER_TAG);
         const checkDropper = !player.hasTag?.(DISABLE_DROPPER_TAG);
-
         if (!checkPlant && !checkHopper && !checkDropper) continue;
 
         for (let dx = -SCAN_RADIUS; dx <= SCAN_RADIUS; dx++) {
           for (let dy = -SCAN_RADIUS; dy <= SCAN_RADIUS; dy++) {
             for (let dz = -SCAN_RADIUS; dz <= SCAN_RADIUS; dz++) {
-              const currentPos = { x: bx + dx, y: by + dy, z: bz + dz };
-              const block = dim.getBlock(currentPos);
+              const pos = { x: bx + dx, y: by + dy, z: bz + dz };
+              const block = dim.getBlock(pos);
 
               if (block) {
                 const typeId = block.typeId;
 
                 if (checkPlant && TWO_HIGH.has(typeId)) {
-                  processPlantCheck(player, dim, block, currentPos);
+                  processPlantCheck(player, dim, block, pos);
                 } else if (checkHopper && typeId === "minecraft:hopper") {
-                  processHopperCheck(player, block, currentPos);
+                  processHopperCheck(player, block, pos);
                 } else if (checkDropper && typeId === "minecraft:dropper") {
-                  processDropperCheck(player, dim, block, currentPos);
+                  processDropperCheck(player, dim, block, pos);
                 }
               }
+
               yield;
             }
           }
         }
       } catch (e) {
         console.warn(`[ERROR] Scanner crashed on player: ${e}`);
-        continue;
       }
     }
     yield "FRAME_END";
@@ -228,16 +364,19 @@ function* mainScanner() {
 const scanner = mainScanner();
 
 system.runInterval(() => {
-  let operations = 0;
+  let ops = 0;
   let result;
 
-  while (operations < BLOCKS_PER_TICK_LIMIT) {
+  while (ops < BLOCKS_PER_TICK_LIMIT) {
     result = scanner.next();
-    operations++;
+    ops++;
     if (result?.value === "FRAME_END") break;
   }
-});
+}, 1);
 
+// -----------------------------
+// Patch Handlers
+// -----------------------------
 function processPlantCheck(player, dim, plantBlock, pos) {
   for (const o of PISTON_OFFSETS) {
     for (const d of [1, 2]) {
@@ -246,27 +385,32 @@ function processPlantCheck(player, dim, plantBlock, pos) {
       const nb = dim.getBlock({ x: bx, y: pos.y, z: bz });
       if (!nb) continue;
 
-      if (nb.typeId === "minecraft:piston" || nb.typeId === "minecraft:sticky_piston") {
-        nb.setType("minecraft:air");
-        console.warn(`[ACTION] Removed Piston at ${bx}, ${pos.y}, ${bz}`);
-        alertDupe(player, "Plant Dupe", plantBlock.typeId, pos);
+      const t = nb.typeId;
+      if (t === "minecraft:piston" || t === "minecraft:sticky_piston") {
+        const ok = setBlockToAir(nb);
+        if (ok) {
+          console.warn(`[ACTION] Removed Piston at ${Math.floor(bx)}, ${Math.floor(pos.y)}, ${Math.floor(bz)}`);
+          alertDupe(player, "Plant Dupe", plantBlock.typeId, pos);
+        }
       }
     }
   }
 }
 
 function processHopperCheck(player, block, pos) {
-  const invComp = block.getComponent?.("minecraft:inventory") ?? block.getComponent?.("inventory");
-  if (!invComp?.container) return;
+  const inv =
+    block.getComponent?.("minecraft:inventory") ??
+    block.getComponent?.("inventory");
+  const cont = inv?.container;
+  if (!cont) return;
 
-  const cont = invComp.container;
   let wiped = false;
-
   for (let slot = 0; slot < cont.size; slot++) {
     const stack = cont.getItem(slot);
     if (!stack) continue;
+
     if (BUNDLE_TYPES.has(stack.typeId)) {
-      cont.setItem(slot, undefined);
+      clearContainerSlot(cont, slot);
       wiped = true;
     }
   }
@@ -275,20 +419,23 @@ function processHopperCheck(player, block, pos) {
 }
 
 function processDropperCheck(player, dim, block, pos) {
-  const invComp = block.getComponent?.("minecraft:inventory") ?? block.getComponent?.("inventory");
-  if (!invComp?.container) return;
+  const inv =
+    block.getComponent?.("minecraft:inventory") ??
+    block.getComponent?.("inventory");
+  const cont = inv?.container;
+  if (!cont) return;
 
-  const cont = invComp.container;
   let wiped = false;
-
   for (let slot = 0; slot < cont.size; slot++) {
     const stack = cont.getItem(slot);
     if (!stack) continue;
+
     if (BUNDLE_TYPES.has(stack.typeId)) {
+      // Eject the restricted item and wipe it from the container
       try {
         dim.spawnItem(stack, { x: pos.x + 0.5, y: pos.y + 1.2, z: pos.z + 0.5 });
       } catch {}
-      cont.setItem(slot, undefined);
+      clearContainerSlot(cont, slot);
       wiped = true;
     }
   }
@@ -296,45 +443,9 @@ function processDropperCheck(player, dim, block, pos) {
   if (wiped) alertDupe(player, "Restricted Item (Ejected)", "Bundle", pos);
 }
 
-// --- ADMIN / ALERT UTILS ---
-function sendAdminAlert(message) {
-  const admins = (world.getAllPlayers?.() ?? world.getPlayers?.() ?? []).filter((p) => p?.hasTag?.(ADMIN_TAG));
-  for (const admin of admins) {
-    if (admin.hasTag?.(DISABLE_ADMIN_MSG_TAG) || admin.hasTag?.(DISABLE_ALERT_TAG)) continue;
-    try { admin.sendMessage(message); } catch {}
-  }
-}
-
-function alertDupe(offender, dupeType, itemDesc, loc) {
-  try {
-    if (!offender || !loc) return;
-
-    const coordStr = `${Math.floor(loc.x)}, ${Math.floor(loc.y)}, ${Math.floor(loc.z)}`;
-    const nearby   = getNearbyPlayers(offender, loc, 50, 12);
-    const nearList = nearby.length > 0 ? nearby.join(", ") : "None";
-
-    const broadcastMsg =
-      `§c<Anti-Dupe> §f§l${offender.nameTag}§r §7attempted a ${dupeType} with §f${itemDesc}§r.`;
-    const adminMsg =
-      `§c<Anti-Dupe> §6Admin Alert: §f§l${offender.nameTag}§r §7attempted a ${dupeType} with §f${itemDesc}§r at §e§l${coordStr}§r.\n§7Nearby: §e${nearList}§r.`;
-
-    const stamp = new Date().toISOString();
-    addDupeLog(`${stamp} | ${offender.nameTag} | ${dupeType} | ${itemDesc} | ${coordStr} | nearby: ${nearList}`);
-
-    const players = world.getAllPlayers?.() ?? world.getPlayers?.() ?? [];
-    for (const p of players) {
-      if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
-        try { p.sendMessage(broadcastMsg); } catch {}
-      }
-    }
-
-    sendAdminAlert(adminMsg);
-  } catch (e) {
-    console.warn(`[ERROR] alertDupe failed: ${e}`);
-  }
-}
-
-// --- UI HANDLING ---
+// -----------------------------
+// UI Handling
+// -----------------------------
 async function ForceOpen(player, form, timeout = 1200) {
   const start = system.currentTick;
   while (system.currentTick - start < timeout) {
@@ -357,13 +468,14 @@ function openDupeLogsMenu(player) {
   ForceOpen(player, form).then((res) => {
     if (res && res.selection === 1) {
       dupeLogs = [];
-      scheduleSaveDupeLogs();
+      queueSaveLogs();
       try { player.sendMessage("§aLogs Cleared."); } catch {}
     }
   });
 }
 
 function openSettingsForm(player) {
+  // IMPORTANT: Use options objects with defaultValue (prevents native type conversion errors)
   const form = new ModalFormData()
     .title("Anti-Dupe Config")
     .toggle("Ghost Stack Patch",    { defaultValue: !player.hasTag?.(DISABLE_GHOST_TAG) })
@@ -383,10 +495,13 @@ function openSettingsForm(player) {
     ];
 
     response.formValues.forEach((enabled, i) => {
+      const tag = tags[i];
+      if (!tag) return;
+
       if (enabled) {
-        if (player.hasTag?.(tags[i])) player.removeTag(tags[i]);
+        if (player.hasTag?.(tag)) player.removeTag(tag);
       } else {
-        if (!player.hasTag?.(tags[i])) player.addTag(tags[i]);
+        if (!player.hasTag?.(tag)) player.addTag(tag);
       }
     });
 
@@ -394,7 +509,7 @@ function openSettingsForm(player) {
   });
 }
 
-// Menu Activation
+// Menu Activation (Admin holds SETTINGS_ITEM)
 world.beforeEvents.itemUse.subscribe((event) => {
   const source = event.source;
   const itemStack = event.itemStack;
@@ -417,29 +532,17 @@ world.beforeEvents.itemUse.subscribe((event) => {
   });
 });
 
-// --- SAFE SLOT GETTER (prevents "Expected type: number") ---
-function getSelectedSlotSafe(player) {
-  const raw = player?.selectedSlot;
-  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-  return 0;
-}
-
-// Optional log viewer via block hit (mining triggers this event too)
+// Optional log viewer via block hit (mining triggers this too — safe guarded)
 world.afterEvents.entityHitBlock.subscribe((event) => {
   const p = event.damagingEntity;
   if (!p || p.typeId !== "minecraft:player") return;
   if (!p.hasTag?.(ADMIN_TAG)) return;
 
-  const invComp =
-    p.getComponent?.("minecraft:inventory") ??
-    p.getComponent?.("inventory");
-  const cont = invComp?.container;
+  const cont = getEntityInventoryContainer(p);
   if (!cont || cont.size <= 0) return;
 
-  let slot = getSelectedSlotSafe(p);
-  if (slot < 0) slot = 0;
-  if (slot >= cont.size) slot = cont.size - 1;
-
+  const slot = getSelectedSlotSafe(p, cont.size);
   const item = cont.getItem(slot);
+
   if (item?.typeId === SETTINGS_ITEM) openDupeLogsMenu(p);
 });
