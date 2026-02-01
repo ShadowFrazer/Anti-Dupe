@@ -10,11 +10,11 @@ const BLOCKS_PER_TICK_LIMIT = 2000;
 const ILLEGAL_STACK_HARD_CAP = 64;   // hard cap
 const ILLEGAL_STACK_SCAN_TICKS = 40; // run every 2s (reduce if you want)
 
-// --- TAGS ---
+// --- Tags ---
 const ADMIN_TAG              = "Admin";
 const SETTINGS_ITEM          = "minecraft:bedrock";
 
-// LEGACY (previous per-admin patch toggles). Patch enable/disable is now WORLD CONFIG.
+// Legacy per-admin patch toggles. Patch control now uses world configuration.
 const DISABLE_GHOST_TAG      = "antidupe:disable_ghost";
 const DISABLE_PLANT_TAG      = "antidupe:disable_plant";
 const DISABLE_HOPPER_TAG     = "antidupe:disable_hopper";
@@ -25,15 +25,15 @@ const DISABLE_ALERT_TAG      = "antidupe:disable_alert";
 const DISABLE_PUBLIC_MSG_TAG = "antidupe:disable_public_msg";
 const DISABLE_ADMIN_MSG_TAG  = "antidupe:disable_admin_msg";
 
-// --- PERSISTED LOG CONFIG (World Dynamic Property) ---
+// --- Log Storage (Dynamic Property) ---
 const DUPE_LOGS_KEY = "antidupe:logs";
 const DUPE_LOGS_MAX_CHARS = 12000;
 
-// --- GLOBAL CONFIG (World Dynamic Property) ---
+// --- Global Configuration Storage ---
 const GLOBAL_CONFIG_KEY = "antidupe:config";
 const GLOBAL_CONFIG_MAX_CHARS = 2400;
 
-// --- RESTRICTED ITEMS (CONFIGURABLE) ---
+// --- Restricted Items ---
 const DEFAULT_RESTRICTED_ITEMS = [
   "minecraft:bundle", "minecraft:red_bundle", "minecraft:blue_bundle",
   "minecraft:black_bundle", "minecraft:cyan_bundle", "minecraft:brown_bundle",
@@ -43,7 +43,7 @@ const DEFAULT_RESTRICTED_ITEMS = [
   "minecraft:white_bundle", "minecraft:yellow_bundle", "minecraft:pink_bundle",
 ];
 
-const MAX_RESTRICTED_ITEMS = 90; // prevents config overflow + UI spam
+const MAX_RESTRICTED_ITEMS = 90; // prevents configuration overflow + UI spam
 
 const DEFAULT_GLOBAL_CONFIG = {
   ghostPatch: true,
@@ -51,13 +51,13 @@ const DEFAULT_GLOBAL_CONFIG = {
   hopperPatch: true,
   dropperPatch: true,
   illegalStackPatch: true,
-  restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(), // NEW
+  restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(),
 };
 
-// --- VIOLATIONS (Scoreboards + Persistent Stats) ---
+// --- Violations ---
 /**
- * Objective IDs MUST be short (common Bedrock limit is 16 chars).
- * We keep these concise and use displayName for human-readable labels.
+ * Objective IDs are intentionally short for compatibility.
+ * Display names provide the readable labels.
  */
 const VIO_OBJ_TOTAL   = "ad_total";
 const VIO_OBJ_GHOST   = "ad_ghost";
@@ -78,7 +78,7 @@ const DEFAULT_VIO_STATS = {
   typeCounts: { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 },
 };
 
-// --- SETS & DATA ---
+// --- Sets and Data ---
 const TWO_HIGH = new Set([
   "minecraft:tall_grass", "minecraft:tall_dry_grass", "minecraft:large_fern",
   "minecraft:sunflower", "minecraft:rose_bush", "minecraft:peony",
@@ -91,9 +91,7 @@ const PISTON_OFFSETS = [
   { x:  1, z:  1 }, { x: -1, z:  1 }, { x:  1, z: -1 }, { x: -1, z: -1 },
 ];
 
-// -----------------------------
-// DEBUG (Runtime Only)
-// -----------------------------
+// --- Debug (Runtime Only) ---
 const DEBUG_LOG_MAX = 250;
 
 let debugLog = []; // runtime only
@@ -136,15 +134,13 @@ function dbgOncePer(key, minTicks, level, area, msg) {
   } catch {}
 }
 
-// -----------------------------
-// Helpers (compat + safety)
-// -----------------------------
+// --- Helpers ---
 function getPlayersSafe() {
   try {
     if (typeof world.getAllPlayers === "function") return world.getAllPlayers();
     if (typeof world.getPlayers === "function") return world.getPlayers();
   } catch (e) {
-    dbgError("players", `getPlayersSafe failed: ${e}`);
+    dbgError("players", `getPlayersSafe error: ${e}`);
   }
   return [];
 }
@@ -153,10 +149,10 @@ function runLater(fn, ticks = 0) {
   try {
     if (typeof system.runTimeout === "function") return system.runTimeout(fn, ticks);
   } catch (e) {
-    dbgWarn("scheduler", `runTimeout unavailable/failed: ${e}`);
+    dbgWarn("scheduler", `runTimeout unavailable or failed: ${e}`);
   }
   try { return system.run(fn); } catch (e) {
-    dbgError("scheduler", `system.run failed: ${e}`);
+    dbgError("scheduler", `system.run error: ${e}`);
   }
 }
 
@@ -167,7 +163,7 @@ function getEntityInventoryContainer(entity) {
       entity?.getComponent?.("inventory");
     return inv?.container ?? undefined;
   } catch (e) {
-    dbgWarn("inventory", `getEntityInventoryContainer failed: ${e}`);
+    dbgWarn("inventory", `getEntityInventoryContainer error: ${e}`);
     return undefined;
   }
 }
@@ -179,7 +175,7 @@ function getCursorInventory(entity) {
       entity?.getComponent?.("cursor_inventory")
     );
   } catch (e) {
-    dbgWarn("inventory", `getCursorInventory failed: ${e}`);
+    dbgWarn("inventory", `getCursorInventory error: ${e}`);
     return undefined;
   }
 }
@@ -196,7 +192,7 @@ function setBlockToAir(block) {
       return true;
     }
   } catch (e) {
-    dbgWarn("blocks", `block.setType failed: ${e}`);
+    dbgWarn("blocks", `block.setType error: ${e}`);
   }
 
   try {
@@ -213,7 +209,7 @@ function setBlockToAir(block) {
       return true;
     }
   } catch (e) {
-    dbgError("blocks", `setBlockToAir command fallback failed: ${e}`);
+    dbgError("blocks", `setBlockToAir command fallback error: ${e}`);
   }
 
   return false;
@@ -243,9 +239,7 @@ function clampInt(n, fallback = 0) {
   return Math.floor(v);
 }
 
-// -----------------------------
-// Dimension helpers (FIX: no more "unknown")
-// -----------------------------
+// --- Dimension Helpers ---
 function dimensionIdFromDimension(dim) {
   try {
     if (!dim) return "unknown";
@@ -259,7 +253,7 @@ function dimensionIdFromDimension(dim) {
 
     return "unknown";
   } catch (e) {
-    dbgWarn("dimension", `dimensionIdFromDimension failed: ${e}`);
+    dbgWarn("dimension", `dimensionIdFromDimension error: ${e}`);
     return "unknown";
   }
 }
@@ -278,29 +272,25 @@ function safeDimIdFromEntity(entity) {
     const dim = entity?.dimension;
     return dimensionIdFromDimension(dim);
   } catch (e) {
-    dbgWarn("dimension", `safeDimIdFromEntity failed: ${e}`);
+    dbgWarn("dimension", `safeDimIdFromEntity error: ${e}`);
     return "unknown";
   }
 }
 
-// -----------------------------
-// Persistence Flags
-// -----------------------------
+// --- Persistence ---
 const persistenceEnabled =
   typeof world.getDynamicProperty === "function" &&
   typeof world.setDynamicProperty === "function";
 
-dbgInfo("boot", `Persistence enabled: ${persistenceEnabled ? "true" : "false"}`);
+dbgInfo("boot", `Persistence Enabled: ${persistenceEnabled ? "true" : "false"}`);
 
-// -----------------------------
-// GLOBAL CONFIG (World Dynamic Property)
-// -----------------------------
+// --- Global Configuration ---
 let globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
 let configLoaded = false;
 let configDirty = false;
 let configSaveQueued = false;
 
-// Cached restricted item set (do NOT rebuild per-scan)
+// Cached restricted item set for scans.
 let restrictedItemsSet = new Set(DEFAULT_RESTRICTED_ITEMS);
 
 function isValidNamespacedId(s) {
@@ -334,10 +324,10 @@ function rebuildRestrictedItemsSet() {
       : DEFAULT_RESTRICTED_ITEMS;
 
     restrictedItemsSet = new Set(list.map(v => String(v).toLowerCase()));
-    dbgInfo("config", `Restricted items set rebuilt (count=${restrictedItemsSet.size})`);
+    dbgInfo("config", `Restricted items set rebuilt (count=${restrictedItemsSet.size}).`);
   } catch (e) {
     restrictedItemsSet = new Set(DEFAULT_RESTRICTED_ITEMS);
-    dbgError("config", `Failed to rebuild restricted item set; reverted to defaults: ${e}`);
+    dbgError("config", `Unable to rebuild restricted item set; reverted to defaults: ${e}`);
   }
 }
 
@@ -362,10 +352,7 @@ function normalizeConfig(obj) {
   return cfg;
 }
 
-/**
- * Ensures config fits GLOBAL_CONFIG_MAX_CHARS by trimming restrictedItems if required.
- * This avoids "full fallback to defaults" when admins add many items.
- */
+// Ensures configuration fits the size cap by trimming restrictedItems when needed.
 function safeStringifyConfigWithCap(cfg) {
   const temp = normalizeConfig(cfg);
   let trimmed = 0;
@@ -402,7 +389,7 @@ function loadGlobalConfig() {
   if (!persistenceEnabled) {
     globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
     rebuildRestrictedItemsSet();
-    dbgWarn("config", "Dynamic properties unavailable; using default config (non-persistent).");
+    dbgWarn("config", "Dynamic properties unavailable; using default configuration (not persistent).");
     return;
   }
 
@@ -412,16 +399,16 @@ function loadGlobalConfig() {
     if (typeof raw !== "string" || raw.length === 0) {
       globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
       rebuildRestrictedItemsSet();
-      dbgInfo("config", "No saved config found; using defaults.");
+      dbgInfo("config", "No saved configuration found; using defaults.");
       return;
     }
 
     globalConfig = normalizeConfig(JSON.parse(raw));
     rebuildRestrictedItemsSet();
-    dbgInfo("config", "Loaded global config successfully.");
+    dbgInfo("config", "Loaded global configuration.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load global config: ${e}`);
-    dbgError("config", `Failed to load global config; reverted to defaults: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to load global configuration: ${e}`);
+    dbgError("config", `Unable to load global configuration; reverted to defaults: ${e}`);
     globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
     rebuildRestrictedItemsSet();
   }
@@ -437,20 +424,20 @@ function saveGlobalConfigNow() {
     configDirty = false;
 
     if (trimmed > 0) {
-      dbgWarn("config", `Config exceeded size cap; trimmed restrictedItems by ${trimmed}.`);
+      dbgWarn("config", `Configuration exceeded size cap; trimmed restrictedItems by ${trimmed}.`);
       // also update in-memory to match what was saved
       try {
         globalConfig = normalizeConfig(JSON.parse(raw));
         rebuildRestrictedItemsSet();
       } catch {}
     } else if (trimmed === -1) {
-      dbgError("config", "Config exceeded size cap and could not be trimmed; fallback config saved.");
+      dbgError("config", "Configuration exceeded size cap and could not be trimmed; fallback configuration saved.");
     } else {
-      dbgInfo("config", "Global config saved.");
+      dbgInfo("config", "Global configuration saved.");
     }
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save global config: ${e}`);
-    dbgError("config", `Failed to save global config: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to save global configuration: ${e}`);
+    dbgError("config", `Unable to save global configuration: ${e}`);
   }
 }
 
@@ -470,16 +457,14 @@ runLater(loadGlobalConfig, 1);
 try {
   world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadGlobalConfig, 1));
 } catch (e) {
-  dbgWarn("config", `worldInitialize subscribe failed: ${e}`);
+  dbgWarn("config", `worldInitialize subscription failed: ${e}`);
 }
 
 system.runInterval(() => {
   try { saveGlobalConfigNow(); } catch {}
 }, 200);
 
-// -----------------------------
-// VIOLATIONS: Scoreboard bootstrap + persistent stats
-// -----------------------------
+// --- Violations ---
 let vioStats = { ...DEFAULT_VIO_STATS };
 let vioStatsLoaded = false;
 let vioStatsDirty = false;
@@ -533,8 +518,8 @@ function loadVioStats() {
     vioStats = normalizeVioStats(JSON.parse(raw));
     dbgInfo("violations", "Loaded violation stats.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load violation stats: ${e}`);
-    dbgError("violations", `Failed to load violation stats; reset to defaults: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to load violation stats: ${e}`);
+    dbgError("violations", `Unable to load violation stats; reset to defaults: ${e}`);
     vioStats = normalizeVioStats(DEFAULT_VIO_STATS);
   }
 }
@@ -549,8 +534,8 @@ function saveVioStatsNow() {
     vioStatsDirty = false;
     dbgInfo("violations", "Violation stats saved.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save violation stats: ${e}`);
-    dbgError("violations", `Failed to save violation stats: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to save violation stats: ${e}`);
+    dbgError("violations", `Unable to save violation stats: ${e}`);
   }
 }
 
@@ -592,7 +577,7 @@ function ensureObjective(id, displayName) {
     return obj;
   } catch (e) {
     console.warn(`[Anti-Dupe] ensureObjective(${id}) failed: ${e}`);
-    dbgError("violations", `ensureObjective(${id}) failed: ${e}`);
+    dbgError("violations", `ensureObjective(${id}) error: ${e}`);
     return undefined;
   }
 }
@@ -701,7 +686,7 @@ function recordViolation(offender, incidentType) {
       }
     } catch (e) {
       console.warn(`[Anti-Dupe] recordViolation scoreboard update failed: ${e}`);
-      dbgError("violations", `recordViolation scoreboard update failed: ${e}`);
+      dbgError("violations", `recordViolation scoreboard update error: ${e}`);
     }
 
     vioStats.globalCount = (vioStats.globalCount | 0) + 1;
@@ -749,7 +734,7 @@ function recordViolation(offender, incidentType) {
     return { key, total, typeScore, global };
   } catch (e) {
     console.warn(`[Anti-Dupe] recordViolation failed: ${e}`);
-    dbgError("violations", `recordViolation failed: ${e}`);
+    dbgError("violations", `recordViolation error: ${e}`);
     return { key: "other", total: 0, typeScore: 0, global: 0 };
   }
 }
@@ -760,7 +745,7 @@ function getViolationsTable() {
     if (!sb) return { rows: [], note: "Scoreboard unavailable." };
 
     const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
-    if (!totalObj) return { rows: [], note: "Violation objectives not initialized yet." };
+    if (!totalObj) return { rows: [], note: "Violation objectives are not initialized yet." };
 
     let scores = [];
     try {
@@ -828,25 +813,8 @@ function prettyTypeKey(k) {
   }
 }
 
-// -----------------------------
-// INCIDENT LOGS (Persistent)
-// -----------------------------
-/**
- * Storage format (compact keys to stay under dynamic property size cap):
- * {
- *   t: ISO timestamp,
- *   p: player name,
- *   ty: incident type (user-facing),
- *   it: item/context,
- *   d: dimension id,
- *   x,y,z: coords,
- *   n: [nearby player names],
- *   vt: total violations after incident (best effort),
- *   vty: violations for this bucket after incident (best effort),
- *   vk: violation key (ghost/plant/hopper/dropper/other),
- *   m: mitigation string
- * }
- */
+// --- Incident Logs ---
+// Stored keys are compact to fit dynamic property limits.
 let dupeLogs = [];
 let logsLoaded = false;
 let logsDirty = false;
@@ -876,15 +844,15 @@ function loadLogs() {
     const raw = world.getDynamicProperty(DUPE_LOGS_KEY);
     if (typeof raw !== "string" || raw.length === 0) {
       dupeLogs = [];
-      dbgInfo("logs", "No saved incident logs found.");
+    dbgInfo("logs", "No saved incident logs found.");
       return;
     }
     const parsed = JSON.parse(raw);
     dupeLogs = Array.isArray(parsed) ? parsed : [];
     dbgInfo("logs", `Loaded incident logs (count=${dupeLogs.length}).`);
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load logs: ${e}`);
-    dbgError("logs", `Failed to load incident logs; reset to empty: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to load logs: ${e}`);
+    dbgError("logs", `Unable to load incident logs; reset to empty: ${e}`);
     dupeLogs = [];
   }
 }
@@ -899,8 +867,8 @@ function saveLogsNow() {
     logsDirty = false;
     dbgInfo("logs", "Incident logs saved.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save logs: ${e}`);
-    dbgError("logs", `Failed to save incident logs: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to save logs: ${e}`);
+    dbgError("logs", `Unable to save incident logs: ${e}`);
   }
 }
 
@@ -931,9 +899,7 @@ system.runInterval(() => {
   try { saveLogsNow(); } catch {}
 }, 200);
 
-// -----------------------------
-// Incident Log formatting (UI)
-// -----------------------------
+// --- Incident Log Formatting ---
 function parseLegacyLogString(s) {
   // Legacy format: `${stamp} | ${name} | ${dupeType} | ${itemDesc} | ${coordStr} | nearby: ${nearList}`
   try {
@@ -990,8 +956,8 @@ function formatIncidentEntry(entry) {
   const lines = [];
   lines.push(`Username: ${username}`);
   lines.push(`Time: ${time || "Unknown"}`);
-  lines.push(`Type of Dupe: ${type}`);
-  if (item) lines.push(`Item / Context: ${item}`);
+  lines.push(`Incident Type: ${type}`);
+  if (item) lines.push(`Item/Context: ${item}`);
   lines.push(`Dimension: ${dimLabel}${dimId && dimId !== "unknown" ? ` (${dimId})` : ""}`);
   lines.push(`Coordinates: ${x}, ${y}, ${z}`);
   lines.push(`Nearby Players: ${nearby}`);
@@ -1008,13 +974,13 @@ function formatIncidentEntry(entry) {
 
 function formatIncidentLogsText(maxEntries = 25) {
   const total = dupeLogs.length;
-  if (total === 0) return "No incident logs.";
+  if (total === 0) return "No incident logs found.";
 
   const newestFirst = [...dupeLogs].reverse();
   const slice = newestFirst.slice(0, maxEntries);
   const blocks = slice.map(formatIncidentEntry);
 
-  let header = `Incident Logs (${Math.min(total, maxEntries)}/${total} shown)\n\n`;
+  let header = `Incident Logs (${Math.min(total, maxEntries)}/${total} Shown)\n\n`;
   let body = blocks.join("\n");
 
   if (total > maxEntries) {
@@ -1038,9 +1004,7 @@ function getMostRecentIncidentSummary() {
   }
 }
 
-// -----------------------------
-// Nearby players helper
-// -----------------------------
+// --- Nearby Players ---
 function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
   const players = getPlayersSafe();
   const nearby = [];
@@ -1065,9 +1029,7 @@ function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
   return nearby;
 }
 
-// -----------------------------
-// Alerts / Reporting
-// -----------------------------
+// --- Alerts and Reporting ---
 function sendAdminAlert(message) {
   const admins = getPlayersSafe().filter((p) => p?.hasTag?.(ADMIN_TAG));
   if (!admins.length) {
@@ -1077,21 +1039,12 @@ function sendAdminAlert(message) {
   for (const admin of admins) {
     if (admin.hasTag?.(DISABLE_ADMIN_MSG_TAG) || admin.hasTag?.(DISABLE_ALERT_TAG)) continue;
     try { admin.sendMessage(message); } catch (e) {
-      dbgWarn("alerts", `Failed to send admin alert to ${admin?.nameTag ?? "admin"}: ${e}`);
+      dbgWarn("alerts", `Unable to send admin alert to ${admin?.nameTag ?? "admin"}: ${e}`);
     }
   }
 }
 
-/**
- * reportIncident:
- * - records a violation
- * - writes structured log
- * - sends public + admin messages
- *
- * mode:
- *  - "attempt": "attempted a ..."
- *  - "detected": "was found with ..."
- */
+// reportIncident: records a violation, writes a log entry, and sends messages.
 function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", mode = "attempt", messageNote = "") {
   try {
     if (!offender || !loc) {
@@ -1145,17 +1098,17 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
     if (mode === "detected") {
       broadcastMsg = `${baseTag} ${who} §7was found with §f${incidentType}§r§7: §f${itemDesc}§r.§7 Item removed.§r${noteText}`;
       adminMsg = `${baseTag} §6Admin Alert:§r ${who} §7was found with §f${incidentType}§r§7: §f${itemDesc}§r ` +
-                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby: §e${nearList}§r.${noteText}`;
+                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby Players: §e${nearList}§r.${noteText}`;
     } else {
       broadcastMsg = `${baseTag} ${who} §7attempted a §f${incidentType}§r §7with §f${itemDesc}§r.§r${noteText}`;
       adminMsg = `${baseTag} §6Admin Alert:§r ${who} §7attempted a §f${incidentType}§r §7with §f${itemDesc}§r ` +
-                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby: §e${nearList}§r.${noteText}`;
+                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby Players: §e${nearList}§r.${noteText}`;
     }
 
     for (const p of getPlayersSafe()) {
       if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
         try { p.sendMessage(broadcastMsg); } catch (e) {
-          dbgWarn("alerts", `Failed public message send: ${e}`);
+          dbgWarn("alerts", `Unable to send public message: ${e}`);
         }
       }
     }
@@ -1164,7 +1117,7 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
     dbgInfo("incident", `${name} | ${mode} | ${incidentType} | ${itemDesc} | ${dimId} @ ${coordStr}`);
   } catch (e) {
     console.warn(`[Anti-Dupe] reportIncident failed: ${e}`);
-    dbgError("incident", `reportIncident failed: ${e}`);
+    dbgError("incident", `reportIncident error: ${e}`);
   }
 }
 
@@ -1176,16 +1129,14 @@ function alertDetected(offender, incidentType, itemDesc, loc, mitigation = "", m
   reportIncident(offender, incidentType, itemDesc, loc, mitigation, "detected", messageNote);
 }
 
-// -----------------------------
-// Ghost Stack Patch (GLOBAL CONFIG CONTROLLED)
-// -----------------------------
+// --- Ghost Stack Patch ---
 world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   try {
     if (!initialSpawn || !player) return;
 
     if (!configLoaded) loadGlobalConfig();
     if (!globalConfig.ghostPatch) {
-      dbgOncePer("ghost_disabled", 600, "info", "ghost", "Ghost Stack Patch is disabled (config).");
+      dbgOncePer("ghost_disabled", 600, "info", "ghost", "Ghost Stack Patch is disabled (configuration).");
       return;
     }
 
@@ -1203,11 +1154,11 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
       try {
         player.dimension.spawnItem(new ItemStack(held.typeId, 1), player.location);
       } catch (e) {
-        dbgWarn("ghost", `Failed to spawnItem in ghost patch: ${e}`);
+        dbgWarn("ghost", `Unable to spawn item in ghost patch: ${e}`);
       }
 
       try { cursor.clear(); } catch (e) {
-        dbgWarn("ghost", `Failed to clear cursor inventory: ${e}`);
+        dbgWarn("ghost", `Unable to clear cursor inventory: ${e}`);
       }
 
       alertDupe(
@@ -1218,7 +1169,7 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
         "Cursor cleared; 1 item dropped; ghost stack prevented."
       );
     } else {
-      dbgOncePer("ghost_no_action", 600, "info", "ghost", "Ghost spawn check ran with no action required.");
+      dbgOncePer("ghost_no_action", 600, "info", "ghost", "Ghost spawn check completed; no action required.");
     }
   } catch (e) {
     console.warn(`[Anti-Dupe] Ghost patch error: ${e}`);
@@ -1226,9 +1177,7 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   }
 });
 
-// -----------------------------
-// Illegal Stack Size Enforcement (GLOBAL CONFIG CONTROLLED)
-// -----------------------------
+// --- Illegal Stack Size Enforcement ---
 function isIllegalAmount(amount, maxAmount) {
   if (!Number.isFinite(amount)) return true;
   if (amount <= 0) return true; // catches "beneath 0" and 0
@@ -1255,7 +1204,7 @@ function enforceIllegalStacksForPlayer(player) {
 
     if (!configLoaded) loadGlobalConfig();
     if (!globalConfig.illegalStackPatch) {
-      dbgOncePer("illegal_disabled", 600, "info", "illegal", "Illegal Stack Patch is disabled (config).");
+      dbgOncePer("illegal_disabled", 600, "info", "illegal", "Illegal Stack Patch is disabled (configuration).");
       return;
     }
 
@@ -1294,7 +1243,7 @@ function enforceIllegalStacksForPlayer(player) {
         }
       }
     } catch (e) {
-      dbgWarn("illegal", `Cursor scan failed: ${e}`);
+      dbgWarn("illegal", `Cursor scan error: ${e}`);
     }
 
     if (!findings.length) return;
@@ -1313,7 +1262,7 @@ function enforceIllegalStacksForPlayer(player) {
     dbgWarn("illegal", `Removed illegal stacks from ${player.nameTag ?? player.name ?? "player"}: ${summary}`);
   } catch (e) {
     console.warn(`[Anti-Dupe] Illegal stack enforcement failed: ${e}`);
-    dbgError("illegal", `Illegal stack enforcement failed: ${e}`);
+    dbgError("illegal", `Illegal stack enforcement error: ${e}`);
   }
 }
 
@@ -1326,11 +1275,9 @@ system.runInterval(() => {
   }
 }, ILLEGAL_STACK_SCAN_TICKS);
 
-// -----------------------------
-// Optimised Scanner (Generator) - GLOBAL CONFIG CONTROLLED
-// -----------------------------
+// --- Scanner ---
 function* mainScanner() {
-  dbgInfo("scanner", "Main scanner started.");
+  dbgInfo("scanner", "Scanner started.");
 
   while (true) {
     const players = getPlayersSafe();
@@ -1339,7 +1286,7 @@ function* mainScanner() {
 
     const scanAny = !!(globalConfig.plantPatch || globalConfig.hopperPatch || globalConfig.dropperPatch);
     if (!scanAny) {
-      dbgOncePer("scanner_disabled", 600, "info", "scanner", "Scanner loop active but all scan patches are disabled.");
+    dbgOncePer("scanner_disabled", 600, "info", "scanner", "Scanner loop active, but all scan patches are disabled.");
       yield "FRAME_END";
       continue;
     }
@@ -1407,9 +1354,7 @@ system.runInterval(() => {
   }
 }, 1);
 
-// -----------------------------
-// Patch Handlers
-// -----------------------------
+// --- Patch Handlers ---
 function processPlantCheck(player, dim, plantBlock, pos) {
   // USER-FACING TYPE: "Piston Dupe"
   for (const o of PISTON_OFFSETS) {
@@ -1434,7 +1379,7 @@ function processPlantCheck(player, dim, plantBlock, pos) {
             "Nearby piston removed."
           );
         } else {
-          dbgError("plant", `Failed to remove piston @ ${bx},${pos.y},${bz}`);
+          dbgError("plant", `Unable to remove piston @ ${bx},${pos.y},${bz}`);
         }
       }
     }
@@ -1453,7 +1398,7 @@ function processHopperCheck(player, block, pos) {
   }
 
   if (!restrictedItemsSet || restrictedItemsSet.size === 0) {
-    dbgOncePer("hopper_no_restrict", 600, "warn", "hopper", "Restricted item list is empty; hopper patch will do nothing.");
+    dbgOncePer("hopper_no_restrict", 600, "warn", "hopper", "Restricted item list is empty; hopper patch is inactive.");
     return;
   }
 
@@ -1495,7 +1440,7 @@ function processDropperCheck(player, dim, block, pos) {
   }
 
   if (!restrictedItemsSet || restrictedItemsSet.size === 0) {
-    dbgOncePer("dropper_no_restrict", 600, "warn", "dropper", "Restricted item list is empty; dropper patch will do nothing.");
+    dbgOncePer("dropper_no_restrict", 600, "warn", "dropper", "Restricted item list is empty; dropper patch is inactive.");
     return;
   }
 
@@ -1512,7 +1457,7 @@ function processDropperCheck(player, dim, block, pos) {
       try {
         dim.spawnItem(stack, { x: pos.x + 0.5, y: pos.y + 1.2, z: pos.z + 0.5 });
       } catch (e) {
-        dbgWarn("dropper", `spawnItem failed during ejection: ${e}`);
+        dbgWarn("dropper", `spawnItem error during ejection: ${e}`);
       }
 
       clearContainerSlot(cont, slot);
@@ -1533,9 +1478,7 @@ function processDropperCheck(player, dim, block, pos) {
   }
 }
 
-// -----------------------------
-// UI Handling
-// -----------------------------
+// --- UI Handling ---
 async function ForceOpen(player, form, timeout = 1200) {
   try {
     const start = system.currentTick;
@@ -1543,19 +1486,17 @@ async function ForceOpen(player, form, timeout = 1200) {
       const response = await form.show(player);
       if (response.cancelationReason !== "UserBusy") return response;
     }
-    dbgWarn("ui", "ForceOpen timed out (player stayed busy).");
+    dbgWarn("ui", "ForceOpen timed out (player remained busy).");
     return undefined;
   } catch (e) {
-    dbgError("ui", `ForceOpen failed: ${e}`);
+    dbgError("ui", `ForceOpen error: ${e}`);
     return undefined;
   }
 }
 
-// -----------------------------
-// LOGS UI
-// -----------------------------
+// --- Logs UI ---
 function openLogsMenu(player) {
-  dbgInfo("ui", "Opened Logs menu.");
+  dbgInfo("ui", "Opened Logs Menu.");
 
   const form = new ActionFormData()
     .title("Logs")
@@ -1576,7 +1517,7 @@ function openIncidentLogsMenu(player) {
   const total = dupeLogs.length;
   const recent = getMostRecentIncidentSummary();
 
-  dbgInfo("ui", "Opened Incident Logs menu.");
+  dbgInfo("ui", "Opened Incident Logs Menu.");
 
   const form = new ActionFormData()
     .title("Incident Logs")
@@ -1612,7 +1553,7 @@ function openIncidentLogViewer(player) {
 }
 
 function confirmClearIncidentLogs(player) {
-  dbgWarn("ui", "Opened Clear Incident Logs confirmation.");
+  dbgWarn("ui", "Opened Clear Incident Logs Confirmation.");
 
   const form = new MessageFormData()
     .title("Clear Incident Logs")
@@ -1625,21 +1566,19 @@ function confirmClearIncidentLogs(player) {
     if (res.selection === 1) {
       dupeLogs = [];
       queueSaveLogs();
-      try { player.sendMessage("§aIncident logs cleared."); } catch {}
+      try { player.sendMessage("§aIncident Logs Cleared."); } catch {}
       dbgWarn("logs", "Incident logs cleared by admin.");
       openIncidentLogsMenu(player);
     }
   });
 }
 
-// -----------------------------
-// VIOLATIONS UI
-// -----------------------------
+// --- Violations UI ---
 function openViolationsDashboard(player) {
   if (!vioStatsLoaded) loadVioStats();
   ensureViolationObjectives();
 
-  dbgInfo("ui", "Opened Violations dashboard.");
+  dbgInfo("ui", "Opened Violations Dashboard.");
 
   const { key: mostKey, count: mostCount } = getMostUsedViolationType();
   const mr = vioStats?.mostRecent ?? { t: "", player: "", type: "" };
@@ -1699,11 +1638,9 @@ function openViolationsDashboard(player) {
   });
 }
 
-// -----------------------------
-// SETTINGS UI (Configuration + Restricted Items + Personal Settings)
-// -----------------------------
+// --- Settings UI ---
 function openSettingsMenu(player) {
-  dbgInfo("ui", "Opened Settings menu.");
+  dbgInfo("ui", "Opened Settings Menu.");
 
   const form = new ActionFormData()
     .title("Settings")
@@ -1724,7 +1661,7 @@ function openSettingsMenu(player) {
 function openConfigurationForm(player) {
   if (!configLoaded) loadGlobalConfig();
 
-  dbgInfo("ui", "Opened Configuration form.");
+  dbgInfo("ui", "Opened Configuration Form.");
 
   const form = new ModalFormData()
     .title("Configuration (World)")
@@ -1750,9 +1687,9 @@ function openConfigurationForm(player) {
 
     rebuildRestrictedItemsSet();
     queueSaveGlobalConfig();
-    dbgWarn("config", "World configuration toggles updated via UI.");
+    dbgWarn("config", "World configuration updated via UI.");
 
-    try { player.sendMessage("§aWorld configuration updated."); } catch {}
+    try { player.sendMessage("§aWorld Configuration Updated."); } catch {}
     openSettingsMenu(player);
   });
 }
@@ -1767,16 +1704,14 @@ function formatRestrictedItemsList(maxLines = 20) {
   return out;
 }
 
-// -----------------------------
-// RESTRICTED ITEMS UI (MISSING)
-// -----------------------------
+// --- Restricted Items UI ---
 function openRestrictedItemsMenu(player) {
   if (!configLoaded) loadGlobalConfig();
 
   const count = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.length : 0;
   const preview = formatRestrictedItemsList(12);
 
-  dbgInfo("ui", "Opened Restricted Items menu.");
+  dbgInfo("ui", "Opened Restricted Items Menu.");
 
   const form = new ActionFormData()
     .title("Restricted Items (World)")
@@ -1797,13 +1732,13 @@ function openRestrictedItemsMenu(player) {
       else if (res.selection === 3) confirmResetRestrictedItems(player);
       else openSettingsMenu(player);
     })
-    .catch((e) => dbgError("ui", `Restricted Items menu crashed: ${e}`));
+    .catch((e) => dbgError("ui", `Restricted Items menu failed: ${e}`));
 }
 
 function openRestrictedItemsViewer(player) {
   if (!configLoaded) loadGlobalConfig();
 
-  dbgInfo("ui", "Opened Restricted Items viewer.");
+  dbgInfo("ui", "Opened Restricted Items Viewer.");
 
   const body = formatRestrictedItemsList(80);
 
@@ -1818,34 +1753,26 @@ function openRestrictedItemsViewer(player) {
       if (!res || res.canceled) return;
       if (res.selection === 1) openRestrictedItemsMenu(player);
     })
-    .catch((e) => dbgError("ui", `Restricted Items viewer crashed: ${e}`));
+    .catch((e) => dbgError("ui", `Restricted Items viewer failed: ${e}`));
 }
-
-
-// -----------------------------
-// UI Compat: ModalFormData.textField signature changed across versions
-// - Older: textField(label, placeholder?, defaultValue?)
-// - Newer: textField(label, placeholder?, options?: ModalFormDataTextFieldOptions)
-// This wrapper prevents native type conversion errors.
-// -----------------------------
-
+// ModalFormData.textField compatibility wrapper.
 function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
-  // Most compatible: 2 args (works on modern + legacy)
+  // Two-argument form works across versions.
   try {
     form.textField(label, placeholder);
     return form;
   } catch (e2) {
-    // Newer overload: options object
+    // Newer overload: options object.
     try {
       form.textField(label, placeholder, { defaultValue: String(defaultValue ?? "") });
       return form;
     } catch (e3) {
-      // Legacy overload: defaultValue string
+      // Legacy overload: defaultValue string.
       try {
         form.textField(label, placeholder, String(defaultValue ?? ""));
         return form;
       } catch (e4) {
-        dbgError("ui", `textField attach failed: ${e2} | ${e3} | ${e4}`);
+        dbgError("ui", `Unable to attach text field: ${e2} | ${e3} | ${e4}`);
         return form;
       }
     }
@@ -1855,10 +1782,10 @@ function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
 
 
 function openAddRestrictedItemForm(player) {
-  dbgInfo("ui", "Opened Add Restricted Item form.");
+  dbgInfo("ui", "Opened Add Restricted Item Form.");
 
   const form = new ModalFormData().title("Add Restricted Item");
-  addTextFieldCompat(form, "Enter item id (namespace:item)", "minecraft:bundle", "");
+  addTextFieldCompat(form, "Enter Item ID (namespace:item)", "minecraft:bundle", "");
 
   ForceOpen(player, form).then((res) => {
     if (!res || res.canceled) return;
@@ -1866,13 +1793,13 @@ function openAddRestrictedItemForm(player) {
     const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
     if (!raw) {
       dbgWarn("restrict", "Add restricted item: empty input.");
-      try { player.sendMessage("§cInvalid input: empty item id."); } catch {}
+      try { player.sendMessage("§cInvalid input: empty Item ID."); } catch {}
       return openRestrictedItemsMenu(player);
     }
 
     if (!isValidNamespacedId(raw)) {
-      dbgWarn("restrict", `Add restricted item: invalid id format: ${raw}`);
-      try { player.sendMessage("§cInvalid item id. Use namespace:item (e.g., minecraft:bundle)."); } catch {}
+      dbgWarn("restrict", `Add restricted item: invalid ID format: ${raw}`);
+      try { player.sendMessage("§cInvalid Item ID. Use namespace:item (e.g., minecraft:bundle)."); } catch {}
       return openRestrictedItemsMenu(player);
     }
 
@@ -1899,8 +1826,8 @@ function openAddRestrictedItemForm(player) {
     rebuildRestrictedItemsSet();
     queueSaveGlobalConfig();
 
-    dbgWarn("restrict", `Added restricted item: ${raw}`);
-    try { player.sendMessage(`§aAdded restricted item: §f${raw}`); } catch {}
+    dbgWarn("restrict", `Restricted item added: ${raw}`);
+    try { player.sendMessage(`§aRestricted Item Added: §f${raw}`); } catch {}
 
     openRestrictedItemsMenu(player);
   });
@@ -1908,14 +1835,14 @@ function openAddRestrictedItemForm(player) {
 
 
 function openRemoveRestrictedItemForm(player) {
-  dbgInfo("ui", "Opened Remove Restricted Item form.");
+  dbgInfo("ui", "Opened Remove Restricted Item Form.");
 
   const preview = formatRestrictedItemsList(10);
   const form = new ModalFormData().title("Remove Restricted Item");
 
   addTextFieldCompat(
     form,
-    `Enter item id to remove\n\nPreview:\n${preview}`,
+    `Enter Item ID to Remove\n\nPreview:\n${preview}`,
     "minecraft:bundle",
     ""
   );
@@ -1926,7 +1853,7 @@ function openRemoveRestrictedItemForm(player) {
     const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
     if (!raw) {
       dbgWarn("restrict", "Remove restricted item: empty input.");
-      try { player.sendMessage("§cInvalid input: empty item id."); } catch {}
+      try { player.sendMessage("§cInvalid input: empty Item ID."); } catch {}
       return openRestrictedItemsMenu(player);
     }
 
@@ -1949,8 +1876,8 @@ function openRemoveRestrictedItemForm(player) {
     rebuildRestrictedItemsSet();
     queueSaveGlobalConfig();
 
-    dbgWarn("restrict", `Removed restricted item: ${raw}`);
-    try { player.sendMessage(`§aRemoved restricted item: §f${raw}`); } catch {}
+    dbgWarn("restrict", `Restricted item removed: ${raw}`);
+    try { player.sendMessage(`§aRestricted Item Removed: §f${raw}`); } catch {}
 
     openRestrictedItemsMenu(player);
   });
@@ -1958,7 +1885,7 @@ function openRemoveRestrictedItemForm(player) {
 
 
 function confirmResetRestrictedItems(player) {
-  dbgWarn("ui", "Opened Restricted Items reset confirmation.");
+  dbgWarn("ui", "Opened Restricted Items Reset Confirmation.");
 
   const form = new MessageFormData()
     .title("Reset Restricted Items")
@@ -1979,7 +1906,7 @@ function confirmResetRestrictedItems(player) {
       queueSaveGlobalConfig();
 
       dbgWarn("restrict", "Restricted item list reset to defaults.");
-      try { player.sendMessage("§aRestricted items reset to defaults."); } catch {}
+      try { player.sendMessage("§aRestricted Items Reset to Defaults."); } catch {}
 
       openRestrictedItemsMenu(player);
     } else {
@@ -1989,13 +1916,13 @@ function confirmResetRestrictedItems(player) {
 }
 
 function openPersonalSettingsForm(player) {
-  dbgInfo("ui", "Opened Personal Settings form.");
+  dbgInfo("ui", "Opened Personal Settings Form.");
 
   const form = new ModalFormData()
     .title("Personal Settings (Admin)")
     .toggle("Public Messages",       !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG))
     .toggle("Admin Messages",        !player.hasTag?.(DISABLE_ADMIN_MSG_TAG))
-    .toggle("Admin Alerts (Coords)", !player.hasTag?.(DISABLE_ALERT_TAG));
+    .toggle("Admin Alerts (Coordinates)", !player.hasTag?.(DISABLE_ALERT_TAG));
 
   ForceOpen(player, form).then((response) => {
     if (!response || response.canceled) return;
@@ -2014,14 +1941,12 @@ function openPersonalSettingsForm(player) {
     });
 
     dbgInfo("ui", "Personal settings updated (tags toggled).");
-    try { player.sendMessage("§aPersonal settings updated."); } catch {}
+    try { player.sendMessage("§aPersonal Settings Updated."); } catch {}
     openSettingsMenu(player);
   });
 }
 
-// -----------------------------
-// DEBUG UI (Runtime Only)
-// -----------------------------
+// --- Debug UI (Runtime Only) ---
 function formatDebugEntry(e) {
   const lvl = (e?.lvl ?? "info").toUpperCase();
   const area = e?.area ?? "core";
@@ -2033,12 +1958,12 @@ function formatDebugEntry(e) {
 
 function formatDebugLogText(maxEntries = 50) {
   const total = debugLog.length;
-  if (!total) return "No debug entries (runtime).";
+  if (!total) return "No debug entries available (runtime).";
 
   const newestFirst = [...debugLog].reverse().slice(0, maxEntries);
   const blocks = newestFirst.map(formatDebugEntry);
 
-  let out = `Debug Log (${Math.min(total, maxEntries)}/${total} shown)\n\n`;
+  let out = `Debug Log (${Math.min(total, maxEntries)}/${total} Shown)\n\n`;
   out += blocks.join("\n\n---\n\n");
 
   if (total > maxEntries) out += `\n\n---\n\nNote: ${total - maxEntries} older entries not shown.`;
@@ -2056,9 +1981,9 @@ function getRuntimeStatusText() {
   lines.push("");
   lines.push(`Tick: ${system.currentTick}`);
   lines.push(`Persistence Enabled: ${persistenceEnabled}`);
-  lines.push(`Config Loaded: ${configLoaded}`);
-  lines.push(`Logs Loaded: ${logsLoaded}`);
-  lines.push(`Violations Loaded: ${vioStatsLoaded}`);
+  lines.push(`Configuration Loaded: ${configLoaded}`);
+  lines.push(`Incident Logs Loaded: ${logsLoaded}`);
+  lines.push(`Violation Stats Loaded: ${vioStatsLoaded}`);
   lines.push(`Violation Objectives Ready: ${vioObjectivesReady}`);
   lines.push(`Scoreboard Available: ${!!world.scoreboard}`);
   lines.push("");
@@ -2069,10 +1994,10 @@ function getRuntimeStatusText() {
   lines.push(`- Dropper Dupe Patch: ${!!globalConfig.dropperPatch}`);
   lines.push(`- Illegal Stack Patch: ${!!globalConfig.illegalStackPatch}`);
   lines.push("");
-  lines.push(`Scanner Enabled (any): ${scanAny}`);
-  lines.push(`Restricted Item Count: ${restrictedCount} (set size=${restrictedItemsSet?.size ?? 0})`);
+  lines.push(`Scanner Enabled (Any): ${scanAny}`);
+  lines.push(`Restricted Item Count: ${restrictedCount} (Set Size=${restrictedItemsSet?.size ?? 0})`);
   lines.push("");
-  lines.push("Debug Counters (runtime):");
+  lines.push("Debug Counters (Runtime):");
   lines.push(`- Info: ${debugCounters.info}`);
   lines.push(`- Warn: ${debugCounters.warn}`);
   lines.push(`- Error: ${debugCounters.error}`);
@@ -2082,7 +2007,7 @@ function getRuntimeStatusText() {
 }
 
 function openDebugMenu(player) {
-  dbgInfo("ui", "Opened Debug menu.");
+  dbgInfo("ui", "Opened Debug Menu.");
 
   const last = debugLog.length ? debugLog[debugLog.length - 1] : null;
   const lastLine = last ? `[${String(last.lvl).toUpperCase()}] ${last.area}: ${last.msg}` : "None";
@@ -2155,17 +2080,15 @@ function confirmClearDebugLog(player) {
       debugCounters = { info: 0, warn: 0, error: 0 };
       debugLastByKey = Object.create(null);
       dbgWarn("debug", "Debug log cleared by admin.");
-      try { player.sendMessage("§aDebug log cleared."); } catch {}
+      try { player.sendMessage("§aDebug Log Cleared."); } catch {}
     }
     openDebugMenu(player);
   });
 }
 
-// -----------------------------
-// MAIN MENU (Settings / Logs / Debug)
-// -----------------------------
+// --- Main Menu ---
 function openMainMenu(player) {
-  dbgInfo("ui", "Opened Main menu.");
+  dbgInfo("ui", "Opened Main Menu.");
 
   const menu = new ActionFormData()
     .title("Anti-Dupe")
@@ -2181,9 +2104,7 @@ function openMainMenu(player) {
   });
 }
 
-// -----------------------------
-// Menu Activation (Admin holds SETTINGS_ITEM)
-// -----------------------------
+// --- Menu Activation ---
 world.beforeEvents.itemUse.subscribe((event) => {
   try {
     const source = event.source;
@@ -2198,11 +2119,11 @@ world.beforeEvents.itemUse.subscribe((event) => {
       openMainMenu(source);
     });
   } catch (e) {
-    dbgError("ui", `itemUse menu open failed: ${e}`);
+    dbgError("ui", `itemUse menu open error: ${e}`);
   }
 });
 
-// Optional menu open via block hit (mining triggers this too — safe guarded)
+// Optional menu open via block hit (mining can trigger this; guarded).
 world.afterEvents.entityHitBlock.subscribe((event) => {
   try {
     const p = event.damagingEntity;
@@ -2217,6 +2138,6 @@ world.afterEvents.entityHitBlock.subscribe((event) => {
 
     if (item?.typeId === SETTINGS_ITEM) openMainMenu(p);
   } catch (e) {
-    dbgWarn("ui", `entityHitBlock handler failed: ${e}`);
+    dbgWarn("ui", `entityHitBlock handler error: ${e}`);
   }
 });
