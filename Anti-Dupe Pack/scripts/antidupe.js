@@ -239,6 +239,35 @@ function clampInt(n, fallback = 0) {
   return Math.floor(v);
 }
 
+function pad2(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "00";
+  return v < 10 ? `0${v}` : String(v);
+}
+
+function formatIsoUtcSplit(isoString) {
+  const raw = String(isoString ?? "");
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) {
+    return {
+      date: "Unknown",
+      time: raw || "Unknown",
+      combined: raw || "Unknown",
+    };
+  }
+
+  const year = d.getUTCFullYear();
+  const month = pad2(d.getUTCMonth() + 1);
+  const day = pad2(d.getUTCDate());
+  const hour = pad2(d.getUTCHours());
+  const minute = pad2(d.getUTCMinutes());
+  const second = pad2(d.getUTCSeconds());
+
+  const date = `${year}-${month}-${day}`;
+  const time = `${hour}:${minute}:${second} UTC`;
+  return { date, time, combined: `${date} | ${time}` };
+}
+
 // --- Dimension Helpers ---
 function dimensionIdFromDimension(dim) {
   try {
@@ -637,8 +666,22 @@ function objectiveIdForKey(k) {
   }
 }
 
+function scoreKeyForPlayer(player) {
+  return String(player?.name ?? player?.nameTag ?? "Unknown").trim();
+}
+
+function isBadOfflineScoreboardName(name) {
+  const s = String(name ?? "");
+  return s.includes("commands.scoreboard.players.offlinePlayerName");
+}
+
 function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
   if (!objective) return 0;
+
+  try {
+    const v = objective.getScore?.(nameFallback);
+    if (Number.isFinite(v)) return v;
+  } catch {}
 
   try {
     const v = objective.getScore?.(entity);
@@ -657,6 +700,66 @@ function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
   return 0;
 }
 
+const migratedViolationNames = new Set();
+
+function migrateViolationScoresForPlayer(player) {
+  try {
+    if (!player) return;
+    const key = scoreKeyForPlayer(player);
+    if (!key || migratedViolationNames.has(key)) return;
+
+    ensureViolationObjectives();
+    const sb = world.scoreboard;
+    if (!sb) return;
+
+    const objectives = [
+      VIO_OBJ_TOTAL,
+      VIO_OBJ_GHOST,
+      VIO_OBJ_PLANT,
+      VIO_OBJ_HOPPER,
+      VIO_OBJ_DROPPER,
+      VIO_OBJ_OTHER,
+    ];
+
+    for (const objId of objectives) {
+      const obj = sb.getObjective(objId);
+      if (!obj) continue;
+
+      let legacyScore = 0;
+      let newScore = 0;
+
+      try {
+        const v = obj.getScore?.(player);
+        if (Number.isFinite(v)) legacyScore = v;
+      } catch {}
+
+      try {
+        const v = obj.getScore?.(key);
+        if (Number.isFinite(v)) newScore = v;
+      } catch {}
+
+      if (legacyScore > 0) {
+        const combined = Math.max(newScore, legacyScore);
+        if (typeof obj.setScore === "function") {
+          try { obj.setScore(key, combined); } catch {}
+        } else if (combined > newScore) {
+          try { obj.addScore?.(key, combined - newScore); } catch {}
+        }
+
+        if (typeof obj.removeParticipant === "function") {
+          try { obj.removeParticipant(player); } catch {}
+        } else if (typeof obj.setScore === "function") {
+          try { obj.setScore(player, 0); } catch {}
+        }
+      }
+    }
+
+    migratedViolationNames.add(key);
+  } catch (e) {
+    dbgWarn("violations", `Violation score migration error: ${e}`);
+  }
+}
+
 /**
  * Increments violations (per-player total + per-type + global),
  * updates persistent tallies, and returns the post-increment totals (best effort).
@@ -670,6 +773,7 @@ function recordViolation(offender, incidentType) {
 
     const key = dupeTypeKey(incidentType);
     const name = offender.nameTag ?? offender.name ?? "Unknown";
+    const scoreKey = scoreKeyForPlayer(offender);
 
     try {
       const sb = world.scoreboard;
@@ -678,8 +782,8 @@ function recordViolation(offender, incidentType) {
         const typeObj  = sb.getObjective(objectiveIdForKey(key));
         const globObj  = sb.getObjective(VIO_OBJ_GLOBAL);
 
-        totalObj?.addScore?.(offender, 1);
-        typeObj?.addScore?.(offender, 1);
+        totalObj?.addScore?.(scoreKey, 1);
+        typeObj?.addScore?.(scoreKey, 1);
         globObj?.addScore?.(GLOBAL_PARTICIPANT, 1);
       } else {
         dbgOncePer("no_scoreboard_add", 200, "warn", "violations", "Cannot increment scores: scoreboard not available.");
@@ -715,8 +819,8 @@ function recordViolation(offender, incidentType) {
         const typeObj  = sb.getObjective(objectiveIdForKey(key));
         const globObj  = sb.getObjective(VIO_OBJ_GLOBAL);
 
-        total = tryGetScoreByEntityOrName(totalObj, offender, name);
-        typeScore = tryGetScoreByEntityOrName(typeObj, offender, name);
+        total = tryGetScoreByEntityOrName(totalObj, offender, scoreKey);
+        typeScore = tryGetScoreByEntityOrName(typeObj, offender, scoreKey);
 
         try {
           const g = globObj?.getScore?.(GLOBAL_PARTICIPANT);
@@ -755,6 +859,7 @@ function getViolationsTable() {
     }
 
     const rows = [];
+    let hiddenLegacy = 0;
     for (const info of scores) {
       const participant = info?.participant;
       const total = info?.score ?? 0;
@@ -762,6 +867,10 @@ function getViolationsTable() {
 
       const pname = participant.displayName ?? "Unknown";
       if (pname === GLOBAL_PARTICIPANT) continue;
+      if (isBadOfflineScoreboardName(pname)) {
+        hiddenLegacy++;
+        continue;
+      }
 
       const ghostObj = sb.getObjective(VIO_OBJ_GHOST);
       const plantObj = sb.getObjective(VIO_OBJ_PLANT);
@@ -769,17 +878,18 @@ function getViolationsTable() {
       const dropObj  = sb.getObjective(VIO_OBJ_DROPPER);
       const otherObj = sb.getObjective(VIO_OBJ_OTHER);
 
-      const ghost = ghostObj?.getScore?.(participant) ?? 0;
-      const plant = plantObj?.getScore?.(participant) ?? 0;
-      const hopper = hopObj?.getScore?.(participant) ?? 0;
-      const dropper = dropObj?.getScore?.(participant) ?? 0;
-      const other = otherObj?.getScore?.(participant) ?? 0;
+      const ghost = tryGetScoreByEntityOrName(ghostObj, participant, pname);
+      const plant = tryGetScoreByEntityOrName(plantObj, participant, pname);
+      const hopper = tryGetScoreByEntityOrName(hopObj, participant, pname);
+      const dropper = tryGetScoreByEntityOrName(dropObj, participant, pname);
+      const other = tryGetScoreByEntityOrName(otherObj, participant, pname);
 
       rows.push({ name: pname, total, ghost, plant, hopper, dropper, other });
     }
 
     rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
-    return { rows, note: "" };
+    const note = hiddenLegacy > 0 ? `Hidden legacy offline entries: ${hiddenLegacy}` : "";
+    return { rows, note };
   } catch (e) {
     return { rows: [], note: `Violations table error: ${e}` };
   }
@@ -954,8 +1064,11 @@ function formatIncidentEntry(entry) {
   const mitigation = e?.m ? String(e.m) : "";
 
   const lines = [];
+  const formatted = formatIsoUtcSplit(time);
+
   lines.push(`Username: ${username}`);
-  lines.push(`Time: ${time || "Unknown"}`);
+  lines.push(`Date: ${formatted.date}`);
+  lines.push(`Time: ${formatted.time}`);
   lines.push(`Incident Type: ${type}`);
   if (item) lines.push(`Item/Context: ${item}`);
   lines.push(`Dimension: ${dimLabel}${dimId && dimId !== "unknown" ? ` (${dimId})` : ""}`);
@@ -998,7 +1111,8 @@ function getMostRecentIncidentSummary() {
     const p = e?.p ?? "Unknown";
     const ty = e?.ty ?? "Unknown";
     const t = e?.t ?? "";
-    return `${p} — ${ty}${t ? ` @ ${t}` : ""}`;
+    const formatted = formatIsoUtcSplit(t);
+    return `${p} — ${ty}${t ? ` @ ${formatted.combined}` : ""}`;
   } catch {
     return "Unknown";
   }
@@ -1133,6 +1247,8 @@ function alertDetected(offender, incidentType, itemDesc, loc, mitigation = "", m
 world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   try {
     if (!initialSpawn || !player) return;
+
+    migrateViolationScoresForPlayer(player);
 
     if (!configLoaded) loadGlobalConfig();
     if (!globalConfig.ghostPatch) {
@@ -1582,6 +1698,7 @@ function openViolationsDashboard(player) {
 
   const { key: mostKey, count: mostCount } = getMostUsedViolationType();
   const mr = vioStats?.mostRecent ?? { t: "", player: "", type: "" };
+  const mrTime = mr.t ? formatIsoUtcSplit(mr.t).combined : "";
 
   const globalCount = Number.isFinite(vioStats.globalCount) ? vioStats.globalCount : 0;
   const { rows, note } = getViolationsTable();
@@ -1590,7 +1707,7 @@ function openViolationsDashboard(player) {
   lines.push("§lViolation Dashboard§r");
   lines.push("");
   lines.push(`§7Global Violation Count:§r §e${globalCount}§r`);
-  lines.push(`§7Most Recent Violation:§r ${mr.player ? `§f${mr.player}§r §7—§r §f${mr.type}§r` : "§8None§r"}`);
+  lines.push(`§7Most Recent Violation:§r ${mr.player ? `§f${mr.player}§r §7—§r §f${mr.type}§r${mrTime ? ` §7@§r §f${mrTime}§r` : ""}` : "§8None§r"}`);
   lines.push(`§7Most Used Violation:§r ${mostKey !== "None" ? `§f${prettyTypeKey(mostKey)}§r §7(${mostCount})§r` : "§8None§r"}`);
   lines.push("");
 
