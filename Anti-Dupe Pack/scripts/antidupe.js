@@ -52,6 +52,22 @@ const DEFAULT_GLOBAL_CONFIG = {
   dropperPatch: true,
   illegalStackPatch: true,
   restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(),
+  punishments: {
+    enabled: true,
+    allowKick: false,
+    bypassTag: "",
+    reasonTemplate: "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
+    cooldownTicks: 40,
+    publicKickMessage: false,
+    types: {
+      ghost:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      plant:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      hopper:  { enabled: true,  threshold: 3, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      dropper: { enabled: true,  threshold: 3, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      illegal: { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      other:   { enabled: false, threshold: 0, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+    },
+  },
 };
 
 // --- Violations ---
@@ -64,6 +80,7 @@ const VIO_OBJ_GHOST   = "ad_ghost";
 const VIO_OBJ_PLANT   = "ad_plant";
 const VIO_OBJ_HOPPER  = "ad_hopper";
 const VIO_OBJ_DROPPER = "ad_dropper";
+const VIO_OBJ_ILLEGAL = "ad_illegal";
 const VIO_OBJ_OTHER   = "ad_other";
 const VIO_OBJ_GLOBAL  = "ad_global"; // fake participant "#global" holds global count
 
@@ -75,7 +92,7 @@ const VIO_STATS_MAX_CHARS = 4000;
 const DEFAULT_VIO_STATS = {
   globalCount: 0,
   mostRecent: { t: "", player: "", type: "" },
-  typeCounts: { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 },
+  typeCounts: { ghost: 0, plant: 0, hopper: 0, dropper: 0, illegal: 0, other: 0 },
 };
 
 // --- Sets and Data ---
@@ -346,6 +363,79 @@ function sanitizeRestrictedItems(arr) {
   return out;
 }
 
+function clampRangeInt(value, min, max, fallback) {
+  const v = clampInt(value, fallback);
+  if (v < min) return min;
+  if (v > max) return max;
+  return v;
+}
+
+function normalizePunishmentType(input, defaults) {
+  const out = { ...defaults };
+  if (!input || typeof input !== "object") return out;
+
+  if ("enabled" in input) out.enabled = !!input.enabled;
+  if ("threshold" in input) out.threshold = clampRangeInt(input.threshold, 0, 20, defaults.threshold);
+  if ("tag" in input) {
+    const t = String(input.tag ?? "").trim();
+    out.tag = t.length > 32 ? t.slice(0, 32) : t;
+  }
+  if ("kickAtThreshold" in input) out.kickAtThreshold = !!input.kickAtThreshold;
+  if ("kickIfTaggedOnRepeat" in input) out.kickIfTaggedOnRepeat = !!input.kickIfTaggedOnRepeat;
+
+  return out;
+}
+
+function normalizePunishments(input) {
+  const defaults = DEFAULT_GLOBAL_CONFIG.punishments;
+  const out = {
+    enabled: defaults.enabled,
+    allowKick: defaults.allowKick,
+    bypassTag: defaults.bypassTag,
+    reasonTemplate: defaults.reasonTemplate,
+    cooldownTicks: defaults.cooldownTicks,
+    publicKickMessage: defaults.publicKickMessage,
+    types: {
+      ghost:   { ...defaults.types.ghost },
+      plant:   { ...defaults.types.plant },
+      hopper:  { ...defaults.types.hopper },
+      dropper: { ...defaults.types.dropper },
+      illegal: { ...defaults.types.illegal },
+      other:   { ...defaults.types.other },
+    },
+  };
+
+  if (!input || typeof input !== "object") return out;
+
+  if ("enabled" in input) out.enabled = !!input.enabled;
+  if ("allowKick" in input) out.allowKick = !!input.allowKick;
+  if ("publicKickMessage" in input) out.publicKickMessage = !!input.publicKickMessage;
+
+  if ("bypassTag" in input) {
+    const t = String(input.bypassTag ?? "").trim();
+    out.bypassTag = t.length > 32 ? t.slice(0, 32) : t;
+  }
+
+  if ("reasonTemplate" in input) {
+    const t = String(input.reasonTemplate ?? "").trim();
+    out.reasonTemplate = t.length > 120 ? t.slice(0, 120) : t;
+  }
+
+  if ("cooldownTicks" in input) {
+    out.cooldownTicks = clampRangeInt(input.cooldownTicks, 0, 200, defaults.cooldownTicks);
+  }
+
+  const types = input.types && typeof input.types === "object" ? input.types : {};
+  out.types.ghost = normalizePunishmentType(types.ghost, defaults.types.ghost);
+  out.types.plant = normalizePunishmentType(types.plant, defaults.types.plant);
+  out.types.hopper = normalizePunishmentType(types.hopper, defaults.types.hopper);
+  out.types.dropper = normalizePunishmentType(types.dropper, defaults.types.dropper);
+  out.types.illegal = normalizePunishmentType(types.illegal, defaults.types.illegal);
+  out.types.other = normalizePunishmentType(types.other, defaults.types.other);
+
+  return out;
+}
+
 function rebuildRestrictedItemsSet() {
   try {
     const list = Array.isArray(globalConfig.restrictedItems)
@@ -376,6 +466,14 @@ function normalizeConfig(obj) {
     } else {
       cfg.restrictedItems = DEFAULT_RESTRICTED_ITEMS.slice();
     }
+
+    if ("punishments" in obj) {
+      cfg.punishments = normalizePunishments(obj.punishments);
+    } else {
+      cfg.punishments = normalizePunishments(null);
+    }
+  } else {
+    cfg.punishments = normalizePunishments(null);
   }
 
   return cfg;
@@ -385,6 +483,8 @@ function normalizeConfig(obj) {
 function safeStringifyConfigWithCap(cfg) {
   const temp = normalizeConfig(cfg);
   let trimmed = 0;
+  let templateTrimStage = 0;
+  let tagsCleared = false;
 
   while (true) {
     let raw = "";
@@ -398,6 +498,21 @@ function safeStringifyConfigWithCap(cfg) {
     if (Array.isArray(temp.restrictedItems) && temp.restrictedItems.length > 0) {
       temp.restrictedItems.pop();
       trimmed++;
+      continue;
+    }
+
+    if (temp.punishments?.reasonTemplate && templateTrimStage < 2) {
+      const limit = templateTrimStage === 0 ? 60 : 30;
+      temp.punishments.reasonTemplate = temp.punishments.reasonTemplate.slice(0, limit);
+      templateTrimStage++;
+      continue;
+    }
+
+    if (!tagsCleared && temp.punishments?.types) {
+      for (const k of Object.keys(temp.punishments.types)) {
+        temp.punishments.types[k].tag = "";
+      }
+      tagsCleared = true;
       continue;
     }
 
@@ -521,6 +636,7 @@ function normalizeVioStats(obj) {
     out.typeCounts.plant   = Number.isFinite(tc.plant)   ? tc.plant   : 0;
     out.typeCounts.hopper  = Number.isFinite(tc.hopper)  ? tc.hopper  : 0;
     out.typeCounts.dropper = Number.isFinite(tc.dropper) ? tc.dropper : 0;
+    out.typeCounts.illegal = Number.isFinite(tc.illegal) ? tc.illegal : 0;
     out.typeCounts.other   = Number.isFinite(tc.other)   ? tc.other   : 0;
   }
 
@@ -623,6 +739,7 @@ function ensureViolationObjectives() {
     ensureObjective(VIO_OBJ_PLANT,   "AntiDupe Plant Violations"),
     ensureObjective(VIO_OBJ_HOPPER,  "AntiDupe Hopper Violations"),
     ensureObjective(VIO_OBJ_DROPPER, "AntiDupe Dropper Violations"),
+    ensureObjective(VIO_OBJ_ILLEGAL, "AntiDupe Illegal Violations"),
     ensureObjective(VIO_OBJ_OTHER,   "AntiDupe Other Violations"),
     ensureObjective(VIO_OBJ_GLOBAL,  "AntiDupe Global Violations"),
   ];
@@ -653,6 +770,7 @@ function dupeTypeKey(dupeType) {
   if (s.includes("piston") || s.includes("plant")) return "plant";
   if (s.includes("hopper")) return "hopper";
   if (s.includes("dropper")) return "dropper";
+  if (s.includes("illegal stack")) return "illegal";
   return "other";
 }
 
@@ -662,6 +780,7 @@ function objectiveIdForKey(k) {
     case "plant": return VIO_OBJ_PLANT;
     case "hopper": return VIO_OBJ_HOPPER;
     case "dropper": return VIO_OBJ_DROPPER;
+    case "illegal": return VIO_OBJ_ILLEGAL;
     default: return VIO_OBJ_OTHER;
   }
 }
@@ -718,6 +837,7 @@ function migrateViolationScoresForPlayer(player) {
       VIO_OBJ_PLANT,
       VIO_OBJ_HOPPER,
       VIO_OBJ_DROPPER,
+      VIO_OBJ_ILLEGAL,
       VIO_OBJ_OTHER,
     ];
 
@@ -796,7 +916,7 @@ function recordViolation(offender, incidentType) {
     vioStats.globalCount = (vioStats.globalCount | 0) + 1;
 
     if (!vioStats.typeCounts || typeof vioStats.typeCounts !== "object") {
-      vioStats.typeCounts = { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 };
+      vioStats.typeCounts = { ghost: 0, plant: 0, hopper: 0, dropper: 0, illegal: 0, other: 0 };
     }
     vioStats.typeCounts[key] = (vioStats.typeCounts[key] | 0) + 1;
 
@@ -843,6 +963,141 @@ function recordViolation(offender, incidentType) {
   }
 }
 
+const lastPunishTickByPlayerName = new Map();
+
+function appendMitigation(base, addition) {
+  const a = String(base ?? "").trim();
+  const b = String(addition ?? "").trim();
+  if (!a) return b;
+  if (!b) return a;
+  return `${a} | ${b}`;
+}
+
+function renderPunishmentReason(template, typeLabel, count, threshold) {
+  const raw = String(template ?? "");
+  return raw
+    .replace(/\{TYPE\}/g, String(typeLabel))
+    .replace(/\{COUNT\}/g, String(count))
+    .replace(/\{THRESHOLD\}/g, String(threshold));
+}
+
+async function tryKickPlayer(player, reason) {
+  try {
+    const name = String(player?.name ?? "").trim();
+    if (!name) return false;
+    const dim = player?.dimension ?? world.getDimension("overworld");
+    const safeReason = String(reason ?? "").replace(/"/g, "'").slice(0, 120);
+    if (typeof dim?.runCommandAsync === "function") {
+      await dim.runCommandAsync(`kick "${name}" "${safeReason}"`);
+      return true;
+    }
+    if (typeof dim?.runCommand === "function") {
+      dim.runCommand(`kick "${name}" "${safeReason}"`);
+      return true;
+    }
+  } catch (e) {
+    dbgWarn("punish", `Kick command error: ${e}`);
+  }
+  return false;
+}
+
+async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
+  try {
+    if (!player) return "";
+    const name = String(player?.name ?? "").trim();
+    if (!name) return "";
+    if (player.hasTag?.(ADMIN_TAG)) return "";
+
+    if (!configLoaded) loadGlobalConfig();
+    const punish = globalConfig.punishments;
+    if (!punish?.enabled) return "";
+
+    const bypassTag = String(punish.bypassTag ?? "").trim();
+    if (bypassTag && player.hasTag?.(bypassTag)) return "";
+
+    const key = dupeTypeKey(incidentType);
+    const typeSettings = punish.types?.[key] ?? punish.types?.other;
+    if (!typeSettings?.enabled) return "";
+
+    const threshold = clampRangeInt(typeSettings.threshold, 0, 20, 0);
+    if (threshold <= 0) return "";
+
+    const typeLabel = prettyTypeKey(key);
+    const typeScore = Number.isFinite(vio?.typeScore) ? vio.typeScore : 0;
+
+    let mitigationNote = "";
+    const tag = String(typeSettings.tag ?? "").trim();
+
+    if (tag) {
+      if (typeSettings.kickIfTaggedOnRepeat && player.hasTag?.(tag)) {
+        if (punish.allowKick) {
+          const now = system.currentTick;
+          const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+          const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
+          if (now - last >= cooldown) {
+            const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
+            const kicked = await tryKickPlayer(player, reason);
+            lastPunishTickByPlayerName.set(name, now);
+            if (kicked) {
+              mitigationNote = appendMitigation(mitigationNote, "Punishment: Kicked (Repeat Offender Tag)");
+              const dimId = safeDimIdFromEntity(player);
+              const dimLabel = prettyDimension(dimId);
+              const pos = player.location ?? loc;
+              const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
+              sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for repeat §f${typeLabel}§r §7violations at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r`);
+              if (punish.publicKickMessage) {
+                for (const p of getPlayersSafe()) {
+                  if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+                    try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+                  }
+                }
+              }
+            }
+          }
+        }
+        return mitigationNote;
+      }
+
+      if (!player.hasTag?.(tag)) {
+        player.addTag?.(tag);
+        mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${tag})`);
+      }
+    }
+
+    if (typeSettings.kickAtThreshold && punish.allowKick && typeScore >= threshold) {
+      const now = system.currentTick;
+      const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+      const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
+      if (now - last >= cooldown) {
+        const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
+        const kicked = await tryKickPlayer(player, reason);
+        lastPunishTickByPlayerName.set(name, now);
+        if (kicked) {
+          mitigationNote = appendMitigation(mitigationNote, `Punishment: Kicked at Threshold (${typeScore}/${threshold})`);
+          const dimId = safeDimIdFromEntity(player);
+          const dimLabel = prettyDimension(dimId);
+          const pos = player.location ?? loc;
+          const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
+          const tagNote = tag ? ` Tag: ${tag}.` : "";
+          sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for §f${typeLabel}§r §7violations (${typeScore}/${threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r${tagNote}`);
+          if (punish.publicKickMessage) {
+            for (const p of getPlayersSafe()) {
+              if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+                try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return mitigationNote;
+  } catch (e) {
+    dbgWarn("punish", `applyPunishment error: ${e}`);
+    return "";
+  }
+}
+
 function getViolationsTable() {
   try {
     const sb = world.scoreboard;
@@ -876,15 +1131,17 @@ function getViolationsTable() {
       const plantObj = sb.getObjective(VIO_OBJ_PLANT);
       const hopObj   = sb.getObjective(VIO_OBJ_HOPPER);
       const dropObj  = sb.getObjective(VIO_OBJ_DROPPER);
+      const illegalObj = sb.getObjective(VIO_OBJ_ILLEGAL);
       const otherObj = sb.getObjective(VIO_OBJ_OTHER);
 
       const ghost = tryGetScoreByEntityOrName(ghostObj, participant, pname);
       const plant = tryGetScoreByEntityOrName(plantObj, participant, pname);
       const hopper = tryGetScoreByEntityOrName(hopObj, participant, pname);
       const dropper = tryGetScoreByEntityOrName(dropObj, participant, pname);
+      const illegal = tryGetScoreByEntityOrName(illegalObj, participant, pname);
       const other = tryGetScoreByEntityOrName(otherObj, participant, pname);
 
-      rows.push({ name: pname, total, ghost, plant, hopper, dropper, other });
+      rows.push({ name: pname, total, ghost, plant, hopper, dropper, illegal, other });
     }
 
     rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
@@ -902,7 +1159,7 @@ function getMostUsedViolationType() {
   let bestKey = "None";
   let best = 0;
 
-  for (const k of ["ghost", "plant", "hopper", "dropper", "other"]) {
+  for (const k of ["ghost", "plant", "hopper", "dropper", "illegal", "other"]) {
     const v = Number.isFinite(tc[k]) ? tc[k] : 0;
     if (v > best) {
       best = v;
@@ -918,6 +1175,7 @@ function prettyTypeKey(k) {
     case "plant": return "Piston";
     case "hopper": return "Hopper";
     case "dropper": return "Dropper";
+    case "illegal": return "Illegal Stack";
     case "other": return "Other";
     default: return String(k ?? "Unknown");
   }
@@ -1159,7 +1417,7 @@ function sendAdminAlert(message) {
 }
 
 // reportIncident: records a violation, writes a log entry, and sends messages.
-function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", mode = "attempt", messageNote = "") {
+async function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", mode = "attempt", messageNote = "") {
   try {
     if (!offender || !loc) {
       dbgWarn("incident", "reportIncident called with missing offender or location.");
@@ -1185,6 +1443,8 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
 
     // 1) Violation increments (best effort)
     const vio = recordViolation(offender, incidentType);
+    const punishmentNote = await applyPunishment(offender, incidentType, itemDesc, loc, vio);
+    const mitigationText = appendMitigation(mitigation, punishmentNote);
 
     // 2) Log entry
     addDupeLog({
@@ -1198,7 +1458,7 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
       vt: Number.isFinite(vio?.total) ? vio.total : undefined,
       vty: Number.isFinite(vio?.typeScore) ? vio.typeScore : undefined,
       vk: vio?.key ? String(vio.key) : undefined,
-      m: String(mitigation ?? ""),
+      m: String(mitigationText ?? ""),
     });
 
     // 3) Messaging
@@ -1713,7 +1973,7 @@ function openViolationsDashboard(player) {
 
   const tc = vioStats.typeCounts ?? {};
   lines.push("§lType Totals§r");
-  lines.push(`§7Ghost:§r ${tc.ghost ?? 0}  §7Piston:§r ${tc.plant ?? 0}  §7Hopper:§r ${tc.hopper ?? 0}  §7Dropper:§r ${tc.dropper ?? 0}  §7Other:§r ${tc.other ?? 0}`);
+  lines.push(`§7Ghost:§r ${tc.ghost ?? 0}  §7Piston:§r ${tc.plant ?? 0}  §7Hopper:§r ${tc.hopper ?? 0}  §7Dropper:§r ${tc.dropper ?? 0}  §7Illegal:§r ${tc.illegal ?? 0}  §7Other:§r ${tc.other ?? 0}`);
   lines.push("");
 
   if (note) {
@@ -1732,7 +1992,7 @@ function openViolationsDashboard(player) {
     for (const r of shown) {
       lines.push(
         `${idx}) §f${r.name}§r — §e${r.total}§r ` +
-        `§7(G:${r.ghost} P:${r.plant} H:${r.hopper} D:${r.dropper} O:${r.other})§r`
+        `§7(G:${r.ghost} P:${r.plant} H:${r.hopper} D:${r.dropper} I:${r.illegal} O:${r.other})§r`
       );
       idx++;
     }
@@ -1772,6 +2032,172 @@ function openSettingsMenu(player) {
     else if (res.selection === 1) openRestrictedItemsMenu(player);
     else if (res.selection === 2) openPersonalSettingsForm(player);
     else openMainMenu(player);
+  });
+}
+
+// --- Punishments UI ---
+function getPunishmentSummaryLines() {
+  if (!configLoaded) loadGlobalConfig();
+  const punish = globalConfig.punishments;
+
+  const status = punish?.enabled ? "Enabled" : "Disabled";
+  const kickStatus = punish?.allowKick ? "Allowed" : "Not Allowed";
+  const bypass = punish?.bypassTag ? punish.bypassTag : "None";
+
+  return [
+    `Status: ${status}`,
+    `Kick Actions: ${kickStatus}`,
+    `Bypass Tag: ${bypass}`,
+  ];
+}
+
+function openPunishmentsMenu(player) {
+  if (!configLoaded) loadGlobalConfig();
+  dbgInfo("ui", "Opened Punishments Menu.");
+
+  const form = new ActionFormData()
+    .title("Punishments")
+    .body(getPunishmentSummaryLines().join("\n"))
+    .button("Global Options")
+    .button("Configure Dupe Types")
+    .button("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 0) openPunishmentGlobalOptionsForm(player);
+    else if (res.selection === 1) openPunishmentTypeMenu(player);
+    else openMainMenu(player);
+  });
+}
+
+function openPunishmentGlobalOptionsForm(player) {
+  if (!configLoaded) loadGlobalConfig();
+  dbgInfo("ui", "Opened Punishment Configuration Form.");
+
+  const punish = globalConfig.punishments;
+  const form = new ModalFormData().title("Punishment Configuration");
+  form.toggle("Enable Punishments", !!punish.enabled);
+  form.toggle("Allow Kick Actions", !!punish.allowKick);
+  addTextFieldCompat(form, "Bypass Tag (Optional)", "antidupe:bypass", punish.bypassTag ?? "");
+  form.slider("Kick Cooldown (Ticks)", 0, 200, 5, clampRangeInt(punish.cooldownTicks, 0, 200, 40));
+  addTextFieldCompat(
+    form,
+    "Kick Reason Template",
+    "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
+    punish.reasonTemplate ?? ""
+  );
+  form.toggle("Public Kick Message", !!punish.publicKickMessage);
+
+  ForceOpen(player, form).then((response) => {
+    if (!response || response.canceled) return;
+    const v = response.formValues ?? [];
+
+    globalConfig = normalizeConfig({
+      ...globalConfig,
+      punishments: {
+        ...globalConfig.punishments,
+        enabled: !!v[0],
+        allowKick: !!v[1],
+        bypassTag: String(v[2] ?? ""),
+        cooldownTicks: clampRangeInt(v[3], 0, 200, globalConfig.punishments.cooldownTicks),
+        reasonTemplate: String(v[4] ?? ""),
+        publicKickMessage: !!v[5],
+        types: globalConfig.punishments.types,
+      },
+    });
+
+    queueSaveGlobalConfig();
+    try { player.sendMessage("§aPunishment Configuration Updated."); } catch {}
+    openPunishmentsMenu(player);
+  });
+}
+
+function formatPunishmentTypeSummary(key) {
+  const types = globalConfig.punishments?.types ?? {};
+  const t = types[key] ?? {};
+  const enabled = t.enabled ? "Enabled" : "Disabled";
+  const threshold = Number.isFinite(t.threshold) && t.threshold > 0 ? t.threshold : "Disabled";
+  const tag = t.tag ? t.tag : "None";
+  const kickAt = t.kickAtThreshold ? "On" : "Off";
+  const kickRepeat = t.kickIfTaggedOnRepeat ? "On" : "Off";
+  return `${prettyTypeKey(key)} — ${enabled} | Threshold: ${threshold} | Tag: ${tag} | Kick At Threshold: ${kickAt} | Kick If Tagged: ${kickRepeat}`;
+}
+
+function openPunishmentTypeMenu(player) {
+  if (!configLoaded) loadGlobalConfig();
+  dbgInfo("ui", "Opened Punishment Type Menu.");
+
+  const lines = [
+    formatPunishmentTypeSummary("ghost"),
+    formatPunishmentTypeSummary("plant"),
+    formatPunishmentTypeSummary("hopper"),
+    formatPunishmentTypeSummary("dropper"),
+    formatPunishmentTypeSummary("illegal"),
+    formatPunishmentTypeSummary("other"),
+  ];
+
+  const form = new ActionFormData()
+    .title("Dupe Type Rules")
+    .body(lines.join("\n"))
+    .button("Ghost Stack")
+    .button("Piston")
+    .button("Hopper")
+    .button("Dropper")
+    .button("Illegal Stack")
+    .button("Other")
+    .button("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 0) openPunishmentTypeForm(player, "ghost");
+    else if (res.selection === 1) openPunishmentTypeForm(player, "plant");
+    else if (res.selection === 2) openPunishmentTypeForm(player, "hopper");
+    else if (res.selection === 3) openPunishmentTypeForm(player, "dropper");
+    else if (res.selection === 4) openPunishmentTypeForm(player, "illegal");
+    else if (res.selection === 5) openPunishmentTypeForm(player, "other");
+    else openPunishmentsMenu(player);
+  });
+}
+
+function openPunishmentTypeForm(player, key) {
+  if (!configLoaded) loadGlobalConfig();
+  const typeSettings = globalConfig.punishments?.types?.[key] ?? {};
+  const title = `Rule: ${prettyTypeKey(key)}`;
+
+  const form = new ModalFormData().title(title);
+  form.toggle("Enabled", !!typeSettings.enabled);
+  form.slider("Threshold (0 = Disabled)", 0, 20, 1, clampRangeInt(typeSettings.threshold, 0, 20, 0));
+  addTextFieldCompat(form, "Violator Tag (Optional)", "antidupe:violator", typeSettings.tag ?? "");
+  form.toggle("Kick At Threshold", !!typeSettings.kickAtThreshold);
+  form.toggle("Kick If Tagged On Repeat", !!typeSettings.kickIfTaggedOnRepeat);
+
+  ForceOpen(player, form).then((response) => {
+    if (!response || response.canceled) return;
+    const v = response.formValues ?? [];
+
+    const updatedTypes = {
+      ...globalConfig.punishments.types,
+      [key]: {
+        ...globalConfig.punishments.types[key],
+        enabled: !!v[0],
+        threshold: clampRangeInt(v[1], 0, 20, 0),
+        tag: String(v[2] ?? ""),
+        kickAtThreshold: !!v[3],
+        kickIfTaggedOnRepeat: !!v[4],
+      },
+    };
+
+    globalConfig = normalizeConfig({
+      ...globalConfig,
+      punishments: {
+        ...globalConfig.punishments,
+        types: updatedTypes,
+      },
+    });
+
+    queueSaveGlobalConfig();
+    try { player.sendMessage(`§aPunishment Rule Updated: §f${prettyTypeKey(key)}`); } catch {}
+    openPunishmentTypeMenu(player);
   });
 }
 
@@ -2211,12 +2637,14 @@ function openMainMenu(player) {
     .title("Anti-Dupe")
     .button("Settings")
     .button("Logs")
+    .button("Punishments")
     .button("Debug");
 
   ForceOpen(player, menu).then((res) => {
     if (!res || res.canceled) return;
     if (res.selection === 0) openSettingsMenu(player);
     else if (res.selection === 1) openLogsMenu(player);
+    else if (res.selection === 2) openPunishmentsMenu(player);
     else openDebugMenu(player);
   });
 }
