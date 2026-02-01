@@ -1,13 +1,13 @@
 {
 	"format_version": 2,
 	"header": {
-		"description": "§aV4.0.0",
+		"description": "§aV4.0.1",
 		"name": "§l§bAnti§f-§cDupe",
 		"uuid": "eb5b8d37-a4f0-4fe5-b9b6-65df07cc57a8",
 		"version": [
 			4,
 			0,
-			0
+			1
 		],
 		"min_engine_version": [
 			1,
@@ -22,7 +22,7 @@
       "version": [
         4,
         0,
-        0
+        1
       ]
     },
     {
