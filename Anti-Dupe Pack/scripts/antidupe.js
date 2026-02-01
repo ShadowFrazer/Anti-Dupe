@@ -2062,54 +2062,61 @@ function openPunishmentsMenu(player) {
     .button("Configure Dupe Types")
     .button("Back");
 
-  ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 0) openPunishmentGlobalOptionsForm(player);
-    else if (res.selection === 1) openPunishmentTypeMenu(player);
-    else openMainMenu(player);
-  });
+  ForceOpen(player, form)
+    .then((res) => {
+      if (!res || res.canceled) return;
+      if (res.selection === 0) openPunishmentGlobalOptionsForm(player);
+      else if (res.selection === 1) openPunishmentTypeMenu(player);
+      else openMainMenu(player);
+    })
+    .catch((e) => dbgError("ui", `Punishments menu failed: ${e}`));
 }
 
 function openPunishmentGlobalOptionsForm(player) {
-  if (!configLoaded) loadGlobalConfig();
-  dbgInfo("ui", "Opened Punishment Configuration Form.");
+  try {
+    if (!configLoaded) loadGlobalConfig();
+    dbgInfo("ui", "Opened Punishment Configuration Form.");
 
-  const punish = globalConfig.punishments;
-  const form = new ModalFormData().title("Punishment Configuration");
-  form.toggle("Enable Punishments", !!punish.enabled);
-  form.toggle("Allow Kick Actions", !!punish.allowKick);
-  addTextFieldCompat(form, "Bypass Tag (Optional)", "antidupe:bypass", punish.bypassTag ?? "");
-  form.slider("Kick Cooldown (Ticks)", 0, 200, 5, clampRangeInt(punish.cooldownTicks, 0, 200, 40));
-  addTextFieldCompat(
-    form,
-    "Kick Reason Template",
-    "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
-    punish.reasonTemplate ?? ""
-  );
-  form.toggle("Public Kick Message", !!punish.publicKickMessage);
+    const punish = globalConfig.punishments;
+    const form = new ModalFormData().title("Punishment Configuration");
+    addToggleCompat(form, "Enable Punishments", !!punish.enabled);
+    addToggleCompat(form, "Allow Kick Actions", !!punish.allowKick);
+    addTextFieldCompat(form, "Bypass Tag (Optional)", "antidupe:bypass", punish.bypassTag ?? "");
+    form.slider("Kick Cooldown (Ticks)", 0, 200, 5, clampRangeInt(punish.cooldownTicks, 0, 200, 40));
+    addTextFieldCompat(
+      form,
+      "Kick Reason Template",
+      "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
+      punish.reasonTemplate ?? ""
+    );
+    addToggleCompat(form, "Public Kick Message", !!punish.publicKickMessage);
 
-  ForceOpen(player, form).then((response) => {
-    if (!response || response.canceled) return;
-    const v = response.formValues ?? [];
+    ForceOpen(player, form).then((response) => {
+      if (!response || response.canceled) return;
+      const v = response.formValues ?? [];
 
-    globalConfig = normalizeConfig({
-      ...globalConfig,
-      punishments: {
-        ...globalConfig.punishments,
-        enabled: !!v[0],
-        allowKick: !!v[1],
-        bypassTag: String(v[2] ?? ""),
-        cooldownTicks: clampRangeInt(v[3], 0, 200, globalConfig.punishments.cooldownTicks),
-        reasonTemplate: String(v[4] ?? ""),
-        publicKickMessage: !!v[5],
-        types: globalConfig.punishments.types,
-      },
-    });
+      globalConfig = normalizeConfig({
+        ...globalConfig,
+        punishments: {
+          ...globalConfig.punishments,
+          enabled: !!v[0],
+          allowKick: !!v[1],
+          bypassTag: String(v[2] ?? ""),
+          cooldownTicks: clampRangeInt(v[3], 0, 200, globalConfig.punishments.cooldownTicks),
+          reasonTemplate: String(v[4] ?? ""),
+          publicKickMessage: !!v[5],
+          types: globalConfig.punishments.types,
+        },
+      });
 
-    queueSaveGlobalConfig();
-    try { player.sendMessage("§aPunishment Configuration Updated."); } catch {}
+      queueSaveGlobalConfig();
+      try { player.sendMessage("§aPunishment Configuration Updated."); } catch {}
+      openPunishmentsMenu(player);
+    }).catch((e) => dbgError("ui", `Punishment configuration submit failed: ${e}`));
+  } catch (e) {
+    dbgError("ui", `Punishments form build failed: ${e}`);
     openPunishmentsMenu(player);
-  });
+  }
 }
 
 function formatPunishmentTypeSummary(key) {
@@ -2160,45 +2167,50 @@ function openPunishmentTypeMenu(player) {
 }
 
 function openPunishmentTypeForm(player, key) {
-  if (!configLoaded) loadGlobalConfig();
-  const typeSettings = globalConfig.punishments?.types?.[key] ?? {};
-  const title = `Rule: ${prettyTypeKey(key)}`;
+  try {
+    if (!configLoaded) loadGlobalConfig();
+    const typeSettings = globalConfig.punishments?.types?.[key] ?? {};
+    const title = `Rule: ${prettyTypeKey(key)}`;
 
-  const form = new ModalFormData().title(title);
-  form.toggle("Enabled", !!typeSettings.enabled);
-  form.slider("Threshold (0 = Disabled)", 0, 20, 1, clampRangeInt(typeSettings.threshold, 0, 20, 0));
-  addTextFieldCompat(form, "Violator Tag (Optional)", "antidupe:violator", typeSettings.tag ?? "");
-  form.toggle("Kick At Threshold", !!typeSettings.kickAtThreshold);
-  form.toggle("Kick If Tagged On Repeat", !!typeSettings.kickIfTaggedOnRepeat);
+    const form = new ModalFormData().title(title);
+    addToggleCompat(form, "Enabled", !!typeSettings.enabled);
+    form.slider("Threshold (0 = Disabled)", 0, 20, 1, clampRangeInt(typeSettings.threshold, 0, 20, 0));
+    addTextFieldCompat(form, "Violator Tag (Optional)", "antidupe:violator", typeSettings.tag ?? "");
+    addToggleCompat(form, "Kick At Threshold", !!typeSettings.kickAtThreshold);
+    addToggleCompat(form, "Kick If Tagged On Repeat", !!typeSettings.kickIfTaggedOnRepeat);
 
-  ForceOpen(player, form).then((response) => {
-    if (!response || response.canceled) return;
-    const v = response.formValues ?? [];
+    ForceOpen(player, form).then((response) => {
+      if (!response || response.canceled) return;
+      const v = response.formValues ?? [];
 
-    const updatedTypes = {
-      ...globalConfig.punishments.types,
-      [key]: {
-        ...globalConfig.punishments.types[key],
-        enabled: !!v[0],
-        threshold: clampRangeInt(v[1], 0, 20, 0),
-        tag: String(v[2] ?? ""),
-        kickAtThreshold: !!v[3],
-        kickIfTaggedOnRepeat: !!v[4],
-      },
-    };
+      const updatedTypes = {
+        ...globalConfig.punishments.types,
+        [key]: {
+          ...globalConfig.punishments.types[key],
+          enabled: !!v[0],
+          threshold: clampRangeInt(v[1], 0, 20, 0),
+          tag: String(v[2] ?? ""),
+          kickAtThreshold: !!v[3],
+          kickIfTaggedOnRepeat: !!v[4],
+        },
+      };
 
-    globalConfig = normalizeConfig({
-      ...globalConfig,
-      punishments: {
-        ...globalConfig.punishments,
-        types: updatedTypes,
-      },
-    });
+      globalConfig = normalizeConfig({
+        ...globalConfig,
+        punishments: {
+          ...globalConfig.punishments,
+          types: updatedTypes,
+        },
+      });
 
-    queueSaveGlobalConfig();
-    try { player.sendMessage(`§aPunishment Rule Updated: §f${prettyTypeKey(key)}`); } catch {}
-    openPunishmentTypeMenu(player);
-  });
+      queueSaveGlobalConfig();
+      try { player.sendMessage(`§aPunishment Rule Updated: §f${prettyTypeKey(key)}`); } catch {}
+      openPunishmentTypeMenu(player);
+    }).catch((e) => dbgError("ui", `Punishment rule submit failed: ${e}`));
+  } catch (e) {
+    dbgError("ui", `Punishments form build failed: ${e}`);
+    openPunishmentsMenu(player);
+  }
 }
 
 function openConfigurationForm(player) {
@@ -2206,13 +2218,12 @@ function openConfigurationForm(player) {
 
   dbgInfo("ui", "Opened Configuration Form.");
 
-  const form = new ModalFormData()
-    .title("Configuration (World)")
-    .toggle("Ghost Stack Patch",    !!globalConfig.ghostPatch)
-    .toggle("Piston Dupe Patch",    !!globalConfig.plantPatch)
-    .toggle("Hopper Dupe Patch",    !!globalConfig.hopperPatch)
-    .toggle("Dropper Dupe Patch",   !!globalConfig.dropperPatch)
-    .toggle("Illegal Stack Patch",  !!globalConfig.illegalStackPatch);
+  const form = new ModalFormData().title("Configuration (World)");
+  addToggleCompat(form, "Ghost Stack Patch", !!globalConfig.ghostPatch);
+  addToggleCompat(form, "Piston Dupe Patch", !!globalConfig.plantPatch);
+  addToggleCompat(form, "Hopper Dupe Patch", !!globalConfig.hopperPatch);
+  addToggleCompat(form, "Dropper Dupe Patch", !!globalConfig.dropperPatch);
+  addToggleCompat(form, "Illegal Stack Patch", !!globalConfig.illegalStackPatch);
 
   ForceOpen(player, form).then((response) => {
     if (!response || response.canceled) return;
@@ -2316,6 +2327,30 @@ function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
         return form;
       } catch (e4) {
         dbgError("ui", `Unable to attach text field: ${e2} | ${e3} | ${e4}`);
+        return form;
+      }
+    }
+  }
+}
+
+// ModalFormData.toggle compatibility wrapper.
+function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
+  try {
+    form.toggle(label);
+    return form;
+  } catch (e1) {
+    try {
+      const opts = { defaultValue: !!defaultValue };
+      const tip = String(tooltip ?? "").trim();
+      if (tip) opts.tooltip = tip;
+      form.toggle(label, opts);
+      return form;
+    } catch (e2) {
+      try {
+        form.toggle(label, !!defaultValue);
+        return form;
+      } catch (e3) {
+        dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
         return form;
       }
     }
@@ -2461,11 +2496,10 @@ function confirmResetRestrictedItems(player) {
 function openPersonalSettingsForm(player) {
   dbgInfo("ui", "Opened Personal Settings Form.");
 
-  const form = new ModalFormData()
-    .title("Personal Settings (Admin)")
-    .toggle("Public Messages",       !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG))
-    .toggle("Admin Messages",        !player.hasTag?.(DISABLE_ADMIN_MSG_TAG))
-    .toggle("Admin Alerts (Coordinates)", !player.hasTag?.(DISABLE_ALERT_TAG));
+  const form = new ModalFormData().title("Personal Settings (Admin)");
+  addToggleCompat(form, "Public Messages", !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG));
+  addToggleCompat(form, "Admin Messages", !player.hasTag?.(DISABLE_ADMIN_MSG_TAG));
+  addToggleCompat(form, "Admin Alerts (Coordinates)", !player.hasTag?.(DISABLE_ALERT_TAG));
 
   ForceOpen(player, form).then((response) => {
     if (!response || response.canceled) return;
