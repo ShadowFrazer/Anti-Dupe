@@ -10,11 +10,11 @@ const BLOCKS_PER_TICK_LIMIT = 2000;
 const ILLEGAL_STACK_HARD_CAP = 64;   // hard cap
 const ILLEGAL_STACK_SCAN_TICKS = 40; // run every 2s (reduce if you want)
 
-// --- TAGS ---
+// --- Tags ---
 const ADMIN_TAG              = "Admin";
 const SETTINGS_ITEM          = "minecraft:bedrock";
 
-// LEGACY (previous per-admin patch toggles). Patch enable/disable is now WORLD CONFIG.
+// Legacy per-admin patch toggles. Patch control now uses world configuration.
 const DISABLE_GHOST_TAG      = "antidupe:disable_ghost";
 const DISABLE_PLANT_TAG      = "antidupe:disable_plant";
 const DISABLE_HOPPER_TAG     = "antidupe:disable_hopper";
@@ -25,15 +25,15 @@ const DISABLE_ALERT_TAG      = "antidupe:disable_alert";
 const DISABLE_PUBLIC_MSG_TAG = "antidupe:disable_public_msg";
 const DISABLE_ADMIN_MSG_TAG  = "antidupe:disable_admin_msg";
 
-// --- PERSISTED LOG CONFIG (World Dynamic Property) ---
+// --- Log Storage (Dynamic Property) ---
 const DUPE_LOGS_KEY = "antidupe:logs";
 const DUPE_LOGS_MAX_CHARS = 12000;
 
-// --- GLOBAL CONFIG (World Dynamic Property) ---
+// --- Global Configuration Storage ---
 const GLOBAL_CONFIG_KEY = "antidupe:config";
 const GLOBAL_CONFIG_MAX_CHARS = 2400;
 
-// --- RESTRICTED ITEMS (CONFIGURABLE) ---
+// --- Restricted Items ---
 const DEFAULT_RESTRICTED_ITEMS = [
   "minecraft:bundle", "minecraft:red_bundle", "minecraft:blue_bundle",
   "minecraft:black_bundle", "minecraft:cyan_bundle", "minecraft:brown_bundle",
@@ -43,7 +43,7 @@ const DEFAULT_RESTRICTED_ITEMS = [
   "minecraft:white_bundle", "minecraft:yellow_bundle", "minecraft:pink_bundle",
 ];
 
-const MAX_RESTRICTED_ITEMS = 90; // prevents config overflow + UI spam
+const MAX_RESTRICTED_ITEMS = 90; // prevents configuration overflow + UI spam
 
 const DEFAULT_GLOBAL_CONFIG = {
   ghostPatch: true,
@@ -51,19 +51,36 @@ const DEFAULT_GLOBAL_CONFIG = {
   hopperPatch: true,
   dropperPatch: true,
   illegalStackPatch: true,
-  restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(), // NEW
+  restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(),
+  punishments: {
+    enabled: true,
+    allowKick: false,
+    bypassTag: "",
+    reasonTemplate: "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
+    cooldownTicks: 40,
+    publicKickMessage: false,
+    types: {
+      ghost:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      plant:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      hopper:  { enabled: true,  threshold: 3, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      dropper: { enabled: true,  threshold: 3, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      illegal: { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+      other:   { enabled: false, threshold: 0, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
+    },
+  },
 };
 
-// --- VIOLATIONS (Scoreboards + Persistent Stats) ---
+// --- Violations ---
 /**
- * Objective IDs MUST be short (common Bedrock limit is 16 chars).
- * We keep these concise and use displayName for human-readable labels.
+ * Objective IDs are intentionally short for compatibility.
+ * Display names provide the readable labels.
  */
 const VIO_OBJ_TOTAL   = "ad_total";
 const VIO_OBJ_GHOST   = "ad_ghost";
 const VIO_OBJ_PLANT   = "ad_plant";
 const VIO_OBJ_HOPPER  = "ad_hopper";
 const VIO_OBJ_DROPPER = "ad_dropper";
+const VIO_OBJ_ILLEGAL = "ad_illegal";
 const VIO_OBJ_OTHER   = "ad_other";
 const VIO_OBJ_GLOBAL  = "ad_global"; // fake participant "#global" holds global count
 
@@ -75,10 +92,10 @@ const VIO_STATS_MAX_CHARS = 4000;
 const DEFAULT_VIO_STATS = {
   globalCount: 0,
   mostRecent: { t: "", player: "", type: "" },
-  typeCounts: { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 },
+  typeCounts: { ghost: 0, plant: 0, hopper: 0, dropper: 0, illegal: 0, other: 0 },
 };
 
-// --- SETS & DATA ---
+// --- Sets and Data ---
 const TWO_HIGH = new Set([
   "minecraft:tall_grass", "minecraft:tall_dry_grass", "minecraft:large_fern",
   "minecraft:sunflower", "minecraft:rose_bush", "minecraft:peony",
@@ -91,9 +108,7 @@ const PISTON_OFFSETS = [
   { x:  1, z:  1 }, { x: -1, z:  1 }, { x:  1, z: -1 }, { x: -1, z: -1 },
 ];
 
-// -----------------------------
-// DEBUG (Runtime Only)
-// -----------------------------
+// --- Debug (Runtime Only) ---
 const DEBUG_LOG_MAX = 250;
 
 let debugLog = []; // runtime only
@@ -136,15 +151,13 @@ function dbgOncePer(key, minTicks, level, area, msg) {
   } catch {}
 }
 
-// -----------------------------
-// Helpers (compat + safety)
-// -----------------------------
+// --- Helpers ---
 function getPlayersSafe() {
   try {
     if (typeof world.getAllPlayers === "function") return world.getAllPlayers();
     if (typeof world.getPlayers === "function") return world.getPlayers();
   } catch (e) {
-    dbgError("players", `getPlayersSafe failed: ${e}`);
+    dbgError("players", `getPlayersSafe error: ${e}`);
   }
   return [];
 }
@@ -153,10 +166,10 @@ function runLater(fn, ticks = 0) {
   try {
     if (typeof system.runTimeout === "function") return system.runTimeout(fn, ticks);
   } catch (e) {
-    dbgWarn("scheduler", `runTimeout unavailable/failed: ${e}`);
+    dbgWarn("scheduler", `runTimeout unavailable or failed: ${e}`);
   }
   try { return system.run(fn); } catch (e) {
-    dbgError("scheduler", `system.run failed: ${e}`);
+    dbgError("scheduler", `system.run error: ${e}`);
   }
 }
 
@@ -167,7 +180,7 @@ function getEntityInventoryContainer(entity) {
       entity?.getComponent?.("inventory");
     return inv?.container ?? undefined;
   } catch (e) {
-    dbgWarn("inventory", `getEntityInventoryContainer failed: ${e}`);
+    dbgWarn("inventory", `getEntityInventoryContainer error: ${e}`);
     return undefined;
   }
 }
@@ -179,7 +192,7 @@ function getCursorInventory(entity) {
       entity?.getComponent?.("cursor_inventory")
     );
   } catch (e) {
-    dbgWarn("inventory", `getCursorInventory failed: ${e}`);
+    dbgWarn("inventory", `getCursorInventory error: ${e}`);
     return undefined;
   }
 }
@@ -196,7 +209,7 @@ function setBlockToAir(block) {
       return true;
     }
   } catch (e) {
-    dbgWarn("blocks", `block.setType failed: ${e}`);
+    dbgWarn("blocks", `block.setType error: ${e}`);
   }
 
   try {
@@ -213,7 +226,7 @@ function setBlockToAir(block) {
       return true;
     }
   } catch (e) {
-    dbgError("blocks", `setBlockToAir command fallback failed: ${e}`);
+    dbgError("blocks", `setBlockToAir command fallback error: ${e}`);
   }
 
   return false;
@@ -243,9 +256,36 @@ function clampInt(n, fallback = 0) {
   return Math.floor(v);
 }
 
-// -----------------------------
-// Dimension helpers (FIX: no more "unknown")
-// -----------------------------
+function pad2(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "00";
+  return v < 10 ? `0${v}` : String(v);
+}
+
+function formatIsoUtcSplit(isoString) {
+  const raw = String(isoString ?? "");
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) {
+    return {
+      date: "Unknown",
+      time: raw || "Unknown",
+      combined: raw || "Unknown",
+    };
+  }
+
+  const year = d.getUTCFullYear();
+  const month = pad2(d.getUTCMonth() + 1);
+  const day = pad2(d.getUTCDate());
+  const hour = pad2(d.getUTCHours());
+  const minute = pad2(d.getUTCMinutes());
+  const second = pad2(d.getUTCSeconds());
+
+  const date = `${year}-${month}-${day}`;
+  const time = `${hour}:${minute}:${second} UTC`;
+  return { date, time, combined: `${date} | ${time}` };
+}
+
+// --- Dimension Helpers ---
 function dimensionIdFromDimension(dim) {
   try {
     if (!dim) return "unknown";
@@ -259,7 +299,7 @@ function dimensionIdFromDimension(dim) {
 
     return "unknown";
   } catch (e) {
-    dbgWarn("dimension", `dimensionIdFromDimension failed: ${e}`);
+    dbgWarn("dimension", `dimensionIdFromDimension error: ${e}`);
     return "unknown";
   }
 }
@@ -278,29 +318,25 @@ function safeDimIdFromEntity(entity) {
     const dim = entity?.dimension;
     return dimensionIdFromDimension(dim);
   } catch (e) {
-    dbgWarn("dimension", `safeDimIdFromEntity failed: ${e}`);
+    dbgWarn("dimension", `safeDimIdFromEntity error: ${e}`);
     return "unknown";
   }
 }
 
-// -----------------------------
-// Persistence Flags
-// -----------------------------
+// --- Persistence ---
 const persistenceEnabled =
   typeof world.getDynamicProperty === "function" &&
   typeof world.setDynamicProperty === "function";
 
-dbgInfo("boot", `Persistence enabled: ${persistenceEnabled ? "true" : "false"}`);
+dbgInfo("boot", `Persistence Enabled: ${persistenceEnabled ? "true" : "false"}`);
 
-// -----------------------------
-// GLOBAL CONFIG (World Dynamic Property)
-// -----------------------------
+// --- Global Configuration ---
 let globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
 let configLoaded = false;
 let configDirty = false;
 let configSaveQueued = false;
 
-// Cached restricted item set (do NOT rebuild per-scan)
+// Cached restricted item set for scans.
 let restrictedItemsSet = new Set(DEFAULT_RESTRICTED_ITEMS);
 
 function isValidNamespacedId(s) {
@@ -327,6 +363,79 @@ function sanitizeRestrictedItems(arr) {
   return out;
 }
 
+function clampRangeInt(value, min, max, fallback) {
+  const v = clampInt(value, fallback);
+  if (v < min) return min;
+  if (v > max) return max;
+  return v;
+}
+
+function normalizePunishmentType(input, defaults) {
+  const out = { ...defaults };
+  if (!input || typeof input !== "object") return out;
+
+  if ("enabled" in input) out.enabled = !!input.enabled;
+  if ("threshold" in input) out.threshold = clampRangeInt(input.threshold, 0, 20, defaults.threshold);
+  if ("tag" in input) {
+    const t = String(input.tag ?? "").trim();
+    out.tag = t.length > 32 ? t.slice(0, 32) : t;
+  }
+  if ("kickAtThreshold" in input) out.kickAtThreshold = !!input.kickAtThreshold;
+  if ("kickIfTaggedOnRepeat" in input) out.kickIfTaggedOnRepeat = !!input.kickIfTaggedOnRepeat;
+
+  return out;
+}
+
+function normalizePunishments(input) {
+  const defaults = DEFAULT_GLOBAL_CONFIG.punishments;
+  const out = {
+    enabled: defaults.enabled,
+    allowKick: defaults.allowKick,
+    bypassTag: defaults.bypassTag,
+    reasonTemplate: defaults.reasonTemplate,
+    cooldownTicks: defaults.cooldownTicks,
+    publicKickMessage: defaults.publicKickMessage,
+    types: {
+      ghost:   { ...defaults.types.ghost },
+      plant:   { ...defaults.types.plant },
+      hopper:  { ...defaults.types.hopper },
+      dropper: { ...defaults.types.dropper },
+      illegal: { ...defaults.types.illegal },
+      other:   { ...defaults.types.other },
+    },
+  };
+
+  if (!input || typeof input !== "object") return out;
+
+  if ("enabled" in input) out.enabled = !!input.enabled;
+  if ("allowKick" in input) out.allowKick = !!input.allowKick;
+  if ("publicKickMessage" in input) out.publicKickMessage = !!input.publicKickMessage;
+
+  if ("bypassTag" in input) {
+    const t = String(input.bypassTag ?? "").trim();
+    out.bypassTag = t.length > 32 ? t.slice(0, 32) : t;
+  }
+
+  if ("reasonTemplate" in input) {
+    const t = String(input.reasonTemplate ?? "").trim();
+    out.reasonTemplate = t.length > 120 ? t.slice(0, 120) : t;
+  }
+
+  if ("cooldownTicks" in input) {
+    out.cooldownTicks = clampRangeInt(input.cooldownTicks, 0, 200, defaults.cooldownTicks);
+  }
+
+  const types = input.types && typeof input.types === "object" ? input.types : {};
+  out.types.ghost = normalizePunishmentType(types.ghost, defaults.types.ghost);
+  out.types.plant = normalizePunishmentType(types.plant, defaults.types.plant);
+  out.types.hopper = normalizePunishmentType(types.hopper, defaults.types.hopper);
+  out.types.dropper = normalizePunishmentType(types.dropper, defaults.types.dropper);
+  out.types.illegal = normalizePunishmentType(types.illegal, defaults.types.illegal);
+  out.types.other = normalizePunishmentType(types.other, defaults.types.other);
+
+  return out;
+}
+
 function rebuildRestrictedItemsSet() {
   try {
     const list = Array.isArray(globalConfig.restrictedItems)
@@ -334,10 +443,10 @@ function rebuildRestrictedItemsSet() {
       : DEFAULT_RESTRICTED_ITEMS;
 
     restrictedItemsSet = new Set(list.map(v => String(v).toLowerCase()));
-    dbgInfo("config", `Restricted items set rebuilt (count=${restrictedItemsSet.size})`);
+    dbgInfo("config", `Restricted items set rebuilt (count=${restrictedItemsSet.size}).`);
   } catch (e) {
     restrictedItemsSet = new Set(DEFAULT_RESTRICTED_ITEMS);
-    dbgError("config", `Failed to rebuild restricted item set; reverted to defaults: ${e}`);
+    dbgError("config", `Unable to rebuild restricted item set; reverted to defaults: ${e}`);
   }
 }
 
@@ -357,18 +466,25 @@ function normalizeConfig(obj) {
     } else {
       cfg.restrictedItems = DEFAULT_RESTRICTED_ITEMS.slice();
     }
+
+    if ("punishments" in obj) {
+      cfg.punishments = normalizePunishments(obj.punishments);
+    } else {
+      cfg.punishments = normalizePunishments(null);
+    }
+  } else {
+    cfg.punishments = normalizePunishments(null);
   }
 
   return cfg;
 }
 
-/**
- * Ensures config fits GLOBAL_CONFIG_MAX_CHARS by trimming restrictedItems if required.
- * This avoids "full fallback to defaults" when admins add many items.
- */
+// Ensures configuration fits the size cap by trimming restrictedItems when needed.
 function safeStringifyConfigWithCap(cfg) {
   const temp = normalizeConfig(cfg);
   let trimmed = 0;
+  let templateTrimStage = 0;
+  let tagsCleared = false;
 
   while (true) {
     let raw = "";
@@ -382,6 +498,21 @@ function safeStringifyConfigWithCap(cfg) {
     if (Array.isArray(temp.restrictedItems) && temp.restrictedItems.length > 0) {
       temp.restrictedItems.pop();
       trimmed++;
+      continue;
+    }
+
+    if (temp.punishments?.reasonTemplate && templateTrimStage < 2) {
+      const limit = templateTrimStage === 0 ? 60 : 30;
+      temp.punishments.reasonTemplate = temp.punishments.reasonTemplate.slice(0, limit);
+      templateTrimStage++;
+      continue;
+    }
+
+    if (!tagsCleared && temp.punishments?.types) {
+      for (const k of Object.keys(temp.punishments.types)) {
+        temp.punishments.types[k].tag = "";
+      }
+      tagsCleared = true;
       continue;
     }
 
@@ -402,7 +533,7 @@ function loadGlobalConfig() {
   if (!persistenceEnabled) {
     globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
     rebuildRestrictedItemsSet();
-    dbgWarn("config", "Dynamic properties unavailable; using default config (non-persistent).");
+    dbgWarn("config", "Dynamic properties unavailable; using default configuration (not persistent).");
     return;
   }
 
@@ -412,16 +543,16 @@ function loadGlobalConfig() {
     if (typeof raw !== "string" || raw.length === 0) {
       globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
       rebuildRestrictedItemsSet();
-      dbgInfo("config", "No saved config found; using defaults.");
+      dbgInfo("config", "No saved configuration found; using defaults.");
       return;
     }
 
     globalConfig = normalizeConfig(JSON.parse(raw));
     rebuildRestrictedItemsSet();
-    dbgInfo("config", "Loaded global config successfully.");
+    dbgInfo("config", "Loaded global configuration.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load global config: ${e}`);
-    dbgError("config", `Failed to load global config; reverted to defaults: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to load global configuration: ${e}`);
+    dbgError("config", `Unable to load global configuration; reverted to defaults: ${e}`);
     globalConfig = { ...DEFAULT_GLOBAL_CONFIG };
     rebuildRestrictedItemsSet();
   }
@@ -437,20 +568,20 @@ function saveGlobalConfigNow() {
     configDirty = false;
 
     if (trimmed > 0) {
-      dbgWarn("config", `Config exceeded size cap; trimmed restrictedItems by ${trimmed}.`);
+      dbgWarn("config", `Configuration exceeded size cap; trimmed restrictedItems by ${trimmed}.`);
       // also update in-memory to match what was saved
       try {
         globalConfig = normalizeConfig(JSON.parse(raw));
         rebuildRestrictedItemsSet();
       } catch {}
     } else if (trimmed === -1) {
-      dbgError("config", "Config exceeded size cap and could not be trimmed; fallback config saved.");
+      dbgError("config", "Configuration exceeded size cap and could not be trimmed; fallback configuration saved.");
     } else {
-      dbgInfo("config", "Global config saved.");
+      dbgInfo("config", "Global configuration saved.");
     }
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save global config: ${e}`);
-    dbgError("config", `Failed to save global config: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to save global configuration: ${e}`);
+    dbgError("config", `Unable to save global configuration: ${e}`);
   }
 }
 
@@ -470,16 +601,14 @@ runLater(loadGlobalConfig, 1);
 try {
   world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadGlobalConfig, 1));
 } catch (e) {
-  dbgWarn("config", `worldInitialize subscribe failed: ${e}`);
+  dbgWarn("config", `worldInitialize subscription failed: ${e}`);
 }
 
 system.runInterval(() => {
   try { saveGlobalConfigNow(); } catch {}
 }, 200);
 
-// -----------------------------
-// VIOLATIONS: Scoreboard bootstrap + persistent stats
-// -----------------------------
+// --- Violations ---
 let vioStats = { ...DEFAULT_VIO_STATS };
 let vioStatsLoaded = false;
 let vioStatsDirty = false;
@@ -507,6 +636,7 @@ function normalizeVioStats(obj) {
     out.typeCounts.plant   = Number.isFinite(tc.plant)   ? tc.plant   : 0;
     out.typeCounts.hopper  = Number.isFinite(tc.hopper)  ? tc.hopper  : 0;
     out.typeCounts.dropper = Number.isFinite(tc.dropper) ? tc.dropper : 0;
+    out.typeCounts.illegal = Number.isFinite(tc.illegal) ? tc.illegal : 0;
     out.typeCounts.other   = Number.isFinite(tc.other)   ? tc.other   : 0;
   }
 
@@ -533,8 +663,8 @@ function loadVioStats() {
     vioStats = normalizeVioStats(JSON.parse(raw));
     dbgInfo("violations", "Loaded violation stats.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load violation stats: ${e}`);
-    dbgError("violations", `Failed to load violation stats; reset to defaults: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to load violation stats: ${e}`);
+    dbgError("violations", `Unable to load violation stats; reset to defaults: ${e}`);
     vioStats = normalizeVioStats(DEFAULT_VIO_STATS);
   }
 }
@@ -549,8 +679,8 @@ function saveVioStatsNow() {
     vioStatsDirty = false;
     dbgInfo("violations", "Violation stats saved.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save violation stats: ${e}`);
-    dbgError("violations", `Failed to save violation stats: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to save violation stats: ${e}`);
+    dbgError("violations", `Unable to save violation stats: ${e}`);
   }
 }
 
@@ -592,7 +722,7 @@ function ensureObjective(id, displayName) {
     return obj;
   } catch (e) {
     console.warn(`[Anti-Dupe] ensureObjective(${id}) failed: ${e}`);
-    dbgError("violations", `ensureObjective(${id}) failed: ${e}`);
+    dbgError("violations", `ensureObjective(${id}) error: ${e}`);
     return undefined;
   }
 }
@@ -609,6 +739,7 @@ function ensureViolationObjectives() {
     ensureObjective(VIO_OBJ_PLANT,   "AntiDupe Plant Violations"),
     ensureObjective(VIO_OBJ_HOPPER,  "AntiDupe Hopper Violations"),
     ensureObjective(VIO_OBJ_DROPPER, "AntiDupe Dropper Violations"),
+    ensureObjective(VIO_OBJ_ILLEGAL, "AntiDupe Illegal Violations"),
     ensureObjective(VIO_OBJ_OTHER,   "AntiDupe Other Violations"),
     ensureObjective(VIO_OBJ_GLOBAL,  "AntiDupe Global Violations"),
   ];
@@ -639,6 +770,7 @@ function dupeTypeKey(dupeType) {
   if (s.includes("piston") || s.includes("plant")) return "plant";
   if (s.includes("hopper")) return "hopper";
   if (s.includes("dropper")) return "dropper";
+  if (s.includes("illegal stack")) return "illegal";
   return "other";
 }
 
@@ -648,12 +780,27 @@ function objectiveIdForKey(k) {
     case "plant": return VIO_OBJ_PLANT;
     case "hopper": return VIO_OBJ_HOPPER;
     case "dropper": return VIO_OBJ_DROPPER;
+    case "illegal": return VIO_OBJ_ILLEGAL;
     default: return VIO_OBJ_OTHER;
   }
 }
 
+function scoreKeyForPlayer(player) {
+  return String(player?.name ?? player?.nameTag ?? "Unknown").trim();
+}
+
+function isBadOfflineScoreboardName(name) {
+  const s = String(name ?? "");
+  return s.includes("commands.scoreboard.players.offlinePlayerName");
+}
+
 function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
   if (!objective) return 0;
+
+  try {
+    const v = objective.getScore?.(nameFallback);
+    if (Number.isFinite(v)) return v;
+  } catch {}
 
   try {
     const v = objective.getScore?.(entity);
@@ -672,6 +819,67 @@ function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
   return 0;
 }
 
+const migratedViolationNames = new Set();
+
+function migrateViolationScoresForPlayer(player) {
+  try {
+    if (!player) return;
+    const key = scoreKeyForPlayer(player);
+    if (!key || migratedViolationNames.has(key)) return;
+
+    ensureViolationObjectives();
+    const sb = world.scoreboard;
+    if (!sb) return;
+
+    const objectives = [
+      VIO_OBJ_TOTAL,
+      VIO_OBJ_GHOST,
+      VIO_OBJ_PLANT,
+      VIO_OBJ_HOPPER,
+      VIO_OBJ_DROPPER,
+      VIO_OBJ_ILLEGAL,
+      VIO_OBJ_OTHER,
+    ];
+
+    for (const objId of objectives) {
+      const obj = sb.getObjective(objId);
+      if (!obj) continue;
+
+      let legacyScore = 0;
+      let newScore = 0;
+
+      try {
+        const v = obj.getScore?.(player);
+        if (Number.isFinite(v)) legacyScore = v;
+      } catch {}
+
+      try {
+        const v = obj.getScore?.(key);
+        if (Number.isFinite(v)) newScore = v;
+      } catch {}
+
+      if (legacyScore > 0) {
+        const combined = Math.max(newScore, legacyScore);
+        if (typeof obj.setScore === "function") {
+          try { obj.setScore(key, combined); } catch {}
+        } else if (combined > newScore) {
+          try { obj.addScore?.(key, combined - newScore); } catch {}
+        }
+
+        if (typeof obj.removeParticipant === "function") {
+          try { obj.removeParticipant(player); } catch {}
+        } else if (typeof obj.setScore === "function") {
+          try { obj.setScore(player, 0); } catch {}
+        }
+      }
+    }
+
+    migratedViolationNames.add(key);
+  } catch (e) {
+    dbgWarn("violations", `Violation score migration error: ${e}`);
+  }
+}
+
 /**
  * Increments violations (per-player total + per-type + global),
  * updates persistent tallies, and returns the post-increment totals (best effort).
@@ -685,6 +893,7 @@ function recordViolation(offender, incidentType) {
 
     const key = dupeTypeKey(incidentType);
     const name = offender.nameTag ?? offender.name ?? "Unknown";
+    const scoreKey = scoreKeyForPlayer(offender);
 
     try {
       const sb = world.scoreboard;
@@ -693,21 +902,21 @@ function recordViolation(offender, incidentType) {
         const typeObj  = sb.getObjective(objectiveIdForKey(key));
         const globObj  = sb.getObjective(VIO_OBJ_GLOBAL);
 
-        totalObj?.addScore?.(offender, 1);
-        typeObj?.addScore?.(offender, 1);
+        totalObj?.addScore?.(scoreKey, 1);
+        typeObj?.addScore?.(scoreKey, 1);
         globObj?.addScore?.(GLOBAL_PARTICIPANT, 1);
       } else {
         dbgOncePer("no_scoreboard_add", 200, "warn", "violations", "Cannot increment scores: scoreboard not available.");
       }
     } catch (e) {
       console.warn(`[Anti-Dupe] recordViolation scoreboard update failed: ${e}`);
-      dbgError("violations", `recordViolation scoreboard update failed: ${e}`);
+      dbgError("violations", `recordViolation scoreboard update error: ${e}`);
     }
 
     vioStats.globalCount = (vioStats.globalCount | 0) + 1;
 
     if (!vioStats.typeCounts || typeof vioStats.typeCounts !== "object") {
-      vioStats.typeCounts = { ghost: 0, plant: 0, hopper: 0, dropper: 0, other: 0 };
+      vioStats.typeCounts = { ghost: 0, plant: 0, hopper: 0, dropper: 0, illegal: 0, other: 0 };
     }
     vioStats.typeCounts[key] = (vioStats.typeCounts[key] | 0) + 1;
 
@@ -730,8 +939,8 @@ function recordViolation(offender, incidentType) {
         const typeObj  = sb.getObjective(objectiveIdForKey(key));
         const globObj  = sb.getObjective(VIO_OBJ_GLOBAL);
 
-        total = tryGetScoreByEntityOrName(totalObj, offender, name);
-        typeScore = tryGetScoreByEntityOrName(typeObj, offender, name);
+        total = tryGetScoreByEntityOrName(totalObj, offender, scoreKey);
+        typeScore = tryGetScoreByEntityOrName(typeObj, offender, scoreKey);
 
         try {
           const g = globObj?.getScore?.(GLOBAL_PARTICIPANT);
@@ -749,8 +958,143 @@ function recordViolation(offender, incidentType) {
     return { key, total, typeScore, global };
   } catch (e) {
     console.warn(`[Anti-Dupe] recordViolation failed: ${e}`);
-    dbgError("violations", `recordViolation failed: ${e}`);
+    dbgError("violations", `recordViolation error: ${e}`);
     return { key: "other", total: 0, typeScore: 0, global: 0 };
+  }
+}
+
+const lastPunishTickByPlayerName = new Map();
+
+function appendMitigation(base, addition) {
+  const a = String(base ?? "").trim();
+  const b = String(addition ?? "").trim();
+  if (!a) return b;
+  if (!b) return a;
+  return `${a} | ${b}`;
+}
+
+function renderPunishmentReason(template, typeLabel, count, threshold) {
+  const raw = String(template ?? "");
+  return raw
+    .replace(/\{TYPE\}/g, String(typeLabel))
+    .replace(/\{COUNT\}/g, String(count))
+    .replace(/\{THRESHOLD\}/g, String(threshold));
+}
+
+async function tryKickPlayer(player, reason) {
+  try {
+    const name = String(player?.name ?? "").trim();
+    if (!name) return false;
+    const dim = player?.dimension ?? world.getDimension("overworld");
+    const safeReason = String(reason ?? "").replace(/"/g, "'").slice(0, 120);
+    if (typeof dim?.runCommandAsync === "function") {
+      await dim.runCommandAsync(`kick "${name}" "${safeReason}"`);
+      return true;
+    }
+    if (typeof dim?.runCommand === "function") {
+      dim.runCommand(`kick "${name}" "${safeReason}"`);
+      return true;
+    }
+  } catch (e) {
+    dbgWarn("punish", `Kick command error: ${e}`);
+  }
+  return false;
+}
+
+async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
+  try {
+    if (!player) return "";
+    const name = String(player?.name ?? "").trim();
+    if (!name) return "";
+    if (player.hasTag?.(ADMIN_TAG)) return "";
+
+    if (!configLoaded) loadGlobalConfig();
+    const punish = globalConfig.punishments;
+    if (!punish?.enabled) return "";
+
+    const bypassTag = String(punish.bypassTag ?? "").trim();
+    if (bypassTag && player.hasTag?.(bypassTag)) return "";
+
+    const key = dupeTypeKey(incidentType);
+    const typeSettings = punish.types?.[key] ?? punish.types?.other;
+    if (!typeSettings?.enabled) return "";
+
+    const threshold = clampRangeInt(typeSettings.threshold, 0, 20, 0);
+    if (threshold <= 0) return "";
+
+    const typeLabel = prettyTypeKey(key);
+    const typeScore = Number.isFinite(vio?.typeScore) ? vio.typeScore : 0;
+
+    let mitigationNote = "";
+    const tag = String(typeSettings.tag ?? "").trim();
+
+    if (tag) {
+      if (typeSettings.kickIfTaggedOnRepeat && player.hasTag?.(tag)) {
+        if (punish.allowKick) {
+          const now = system.currentTick;
+          const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+          const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
+          if (now - last >= cooldown) {
+            const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
+            const kicked = await tryKickPlayer(player, reason);
+            lastPunishTickByPlayerName.set(name, now);
+            if (kicked) {
+              mitigationNote = appendMitigation(mitigationNote, "Punishment: Kicked (Repeat Offender Tag)");
+              const dimId = safeDimIdFromEntity(player);
+              const dimLabel = prettyDimension(dimId);
+              const pos = player.location ?? loc;
+              const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
+              sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for repeat §f${typeLabel}§r §7violations at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r`);
+              if (punish.publicKickMessage) {
+                for (const p of getPlayersSafe()) {
+                  if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+                    try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+                  }
+                }
+              }
+            }
+          }
+        }
+        return mitigationNote;
+      }
+
+      if (!player.hasTag?.(tag)) {
+        player.addTag?.(tag);
+        mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${tag})`);
+      }
+    }
+
+    if (typeSettings.kickAtThreshold && punish.allowKick && typeScore >= threshold) {
+      const now = system.currentTick;
+      const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+      const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
+      if (now - last >= cooldown) {
+        const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
+        const kicked = await tryKickPlayer(player, reason);
+        lastPunishTickByPlayerName.set(name, now);
+        if (kicked) {
+          mitigationNote = appendMitigation(mitigationNote, `Punishment: Kicked at Threshold (${typeScore}/${threshold})`);
+          const dimId = safeDimIdFromEntity(player);
+          const dimLabel = prettyDimension(dimId);
+          const pos = player.location ?? loc;
+          const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
+          const tagNote = tag ? ` Tag: ${tag}.` : "";
+          sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for §f${typeLabel}§r §7violations (${typeScore}/${threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r${tagNote}`);
+          if (punish.publicKickMessage) {
+            for (const p of getPlayersSafe()) {
+              if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+                try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return mitigationNote;
+  } catch (e) {
+    dbgWarn("punish", `applyPunishment error: ${e}`);
+    return "";
   }
 }
 
@@ -760,7 +1104,7 @@ function getViolationsTable() {
     if (!sb) return { rows: [], note: "Scoreboard unavailable." };
 
     const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
-    if (!totalObj) return { rows: [], note: "Violation objectives not initialized yet." };
+    if (!totalObj) return { rows: [], note: "Violation objectives are not initialized yet." };
 
     let scores = [];
     try {
@@ -770,6 +1114,7 @@ function getViolationsTable() {
     }
 
     const rows = [];
+    let hiddenLegacy = 0;
     for (const info of scores) {
       const participant = info?.participant;
       const total = info?.score ?? 0;
@@ -777,24 +1122,31 @@ function getViolationsTable() {
 
       const pname = participant.displayName ?? "Unknown";
       if (pname === GLOBAL_PARTICIPANT) continue;
+      if (isBadOfflineScoreboardName(pname)) {
+        hiddenLegacy++;
+        continue;
+      }
 
       const ghostObj = sb.getObjective(VIO_OBJ_GHOST);
       const plantObj = sb.getObjective(VIO_OBJ_PLANT);
       const hopObj   = sb.getObjective(VIO_OBJ_HOPPER);
       const dropObj  = sb.getObjective(VIO_OBJ_DROPPER);
+      const illegalObj = sb.getObjective(VIO_OBJ_ILLEGAL);
       const otherObj = sb.getObjective(VIO_OBJ_OTHER);
 
-      const ghost = ghostObj?.getScore?.(participant) ?? 0;
-      const plant = plantObj?.getScore?.(participant) ?? 0;
-      const hopper = hopObj?.getScore?.(participant) ?? 0;
-      const dropper = dropObj?.getScore?.(participant) ?? 0;
-      const other = otherObj?.getScore?.(participant) ?? 0;
+      const ghost = tryGetScoreByEntityOrName(ghostObj, participant, pname);
+      const plant = tryGetScoreByEntityOrName(plantObj, participant, pname);
+      const hopper = tryGetScoreByEntityOrName(hopObj, participant, pname);
+      const dropper = tryGetScoreByEntityOrName(dropObj, participant, pname);
+      const illegal = tryGetScoreByEntityOrName(illegalObj, participant, pname);
+      const other = tryGetScoreByEntityOrName(otherObj, participant, pname);
 
-      rows.push({ name: pname, total, ghost, plant, hopper, dropper, other });
+      rows.push({ name: pname, total, ghost, plant, hopper, dropper, illegal, other });
     }
 
     rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
-    return { rows, note: "" };
+    const note = hiddenLegacy > 0 ? `Hidden legacy offline entries: ${hiddenLegacy}` : "";
+    return { rows, note };
   } catch (e) {
     return { rows: [], note: `Violations table error: ${e}` };
   }
@@ -807,7 +1159,7 @@ function getMostUsedViolationType() {
   let bestKey = "None";
   let best = 0;
 
-  for (const k of ["ghost", "plant", "hopper", "dropper", "other"]) {
+  for (const k of ["ghost", "plant", "hopper", "dropper", "illegal", "other"]) {
     const v = Number.isFinite(tc[k]) ? tc[k] : 0;
     if (v > best) {
       best = v;
@@ -823,30 +1175,14 @@ function prettyTypeKey(k) {
     case "plant": return "Piston";
     case "hopper": return "Hopper";
     case "dropper": return "Dropper";
+    case "illegal": return "Illegal Stack";
     case "other": return "Other";
     default: return String(k ?? "Unknown");
   }
 }
 
-// -----------------------------
-// INCIDENT LOGS (Persistent)
-// -----------------------------
-/**
- * Storage format (compact keys to stay under dynamic property size cap):
- * {
- *   t: ISO timestamp,
- *   p: player name,
- *   ty: incident type (user-facing),
- *   it: item/context,
- *   d: dimension id,
- *   x,y,z: coords,
- *   n: [nearby player names],
- *   vt: total violations after incident (best effort),
- *   vty: violations for this bucket after incident (best effort),
- *   vk: violation key (ghost/plant/hopper/dropper/other),
- *   m: mitigation string
- * }
- */
+// --- Incident Logs ---
+// Stored keys are compact to fit dynamic property limits.
 let dupeLogs = [];
 let logsLoaded = false;
 let logsDirty = false;
@@ -876,15 +1212,15 @@ function loadLogs() {
     const raw = world.getDynamicProperty(DUPE_LOGS_KEY);
     if (typeof raw !== "string" || raw.length === 0) {
       dupeLogs = [];
-      dbgInfo("logs", "No saved incident logs found.");
+    dbgInfo("logs", "No saved incident logs found.");
       return;
     }
     const parsed = JSON.parse(raw);
     dupeLogs = Array.isArray(parsed) ? parsed : [];
     dbgInfo("logs", `Loaded incident logs (count=${dupeLogs.length}).`);
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to load logs: ${e}`);
-    dbgError("logs", `Failed to load incident logs; reset to empty: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to load logs: ${e}`);
+    dbgError("logs", `Unable to load incident logs; reset to empty: ${e}`);
     dupeLogs = [];
   }
 }
@@ -899,8 +1235,8 @@ function saveLogsNow() {
     logsDirty = false;
     dbgInfo("logs", "Incident logs saved.");
   } catch (e) {
-    console.warn(`[Anti-Dupe] Failed to save logs: ${e}`);
-    dbgError("logs", `Failed to save incident logs: ${e}`);
+    console.warn(`[Anti-Dupe] Unable to save logs: ${e}`);
+    dbgError("logs", `Unable to save incident logs: ${e}`);
   }
 }
 
@@ -931,9 +1267,7 @@ system.runInterval(() => {
   try { saveLogsNow(); } catch {}
 }, 200);
 
-// -----------------------------
-// Incident Log formatting (UI)
-// -----------------------------
+// --- Incident Log Formatting ---
 function parseLegacyLogString(s) {
   // Legacy format: `${stamp} | ${name} | ${dupeType} | ${itemDesc} | ${coordStr} | nearby: ${nearList}`
   try {
@@ -988,10 +1322,13 @@ function formatIncidentEntry(entry) {
   const mitigation = e?.m ? String(e.m) : "";
 
   const lines = [];
+  const formatted = formatIsoUtcSplit(time);
+
   lines.push(`Username: ${username}`);
-  lines.push(`Time: ${time || "Unknown"}`);
-  lines.push(`Type of Dupe: ${type}`);
-  if (item) lines.push(`Item / Context: ${item}`);
+  lines.push(`Date: ${formatted.date}`);
+  lines.push(`Time: ${formatted.time}`);
+  lines.push(`Incident Type: ${type}`);
+  if (item) lines.push(`Item/Context: ${item}`);
   lines.push(`Dimension: ${dimLabel}${dimId && dimId !== "unknown" ? ` (${dimId})` : ""}`);
   lines.push(`Coordinates: ${x}, ${y}, ${z}`);
   lines.push(`Nearby Players: ${nearby}`);
@@ -1008,13 +1345,13 @@ function formatIncidentEntry(entry) {
 
 function formatIncidentLogsText(maxEntries = 25) {
   const total = dupeLogs.length;
-  if (total === 0) return "No incident logs.";
+  if (total === 0) return "No incident logs found.";
 
   const newestFirst = [...dupeLogs].reverse();
   const slice = newestFirst.slice(0, maxEntries);
   const blocks = slice.map(formatIncidentEntry);
 
-  let header = `Incident Logs (${Math.min(total, maxEntries)}/${total} shown)\n\n`;
+  let header = `Incident Logs (${Math.min(total, maxEntries)}/${total} Shown)\n\n`;
   let body = blocks.join("\n");
 
   if (total > maxEntries) {
@@ -1032,15 +1369,14 @@ function getMostRecentIncidentSummary() {
     const p = e?.p ?? "Unknown";
     const ty = e?.ty ?? "Unknown";
     const t = e?.t ?? "";
-    return `${p} — ${ty}${t ? ` @ ${t}` : ""}`;
+    const formatted = formatIsoUtcSplit(t);
+    return `${p} — ${ty}${t ? ` @ ${formatted.combined}` : ""}`;
   } catch {
     return "Unknown";
   }
 }
 
-// -----------------------------
-// Nearby players helper
-// -----------------------------
+// --- Nearby Players ---
 function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
   const players = getPlayersSafe();
   const nearby = [];
@@ -1065,9 +1401,7 @@ function getNearbyPlayers(offender, loc, radius = 50, cap = 12) {
   return nearby;
 }
 
-// -----------------------------
-// Alerts / Reporting
-// -----------------------------
+// --- Alerts and Reporting ---
 function sendAdminAlert(message) {
   const admins = getPlayersSafe().filter((p) => p?.hasTag?.(ADMIN_TAG));
   if (!admins.length) {
@@ -1077,22 +1411,13 @@ function sendAdminAlert(message) {
   for (const admin of admins) {
     if (admin.hasTag?.(DISABLE_ADMIN_MSG_TAG) || admin.hasTag?.(DISABLE_ALERT_TAG)) continue;
     try { admin.sendMessage(message); } catch (e) {
-      dbgWarn("alerts", `Failed to send admin alert to ${admin?.nameTag ?? "admin"}: ${e}`);
+      dbgWarn("alerts", `Unable to send admin alert to ${admin?.nameTag ?? "admin"}: ${e}`);
     }
   }
 }
 
-/**
- * reportIncident:
- * - records a violation
- * - writes structured log
- * - sends public + admin messages
- *
- * mode:
- *  - "attempt": "attempted a ..."
- *  - "detected": "was found with ..."
- */
-function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", mode = "attempt", messageNote = "") {
+// reportIncident: records a violation, writes a log entry, and sends messages.
+async function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", mode = "attempt", messageNote = "") {
   try {
     if (!offender || !loc) {
       dbgWarn("incident", "reportIncident called with missing offender or location.");
@@ -1118,6 +1443,8 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
 
     // 1) Violation increments (best effort)
     const vio = recordViolation(offender, incidentType);
+    const punishmentNote = await applyPunishment(offender, incidentType, itemDesc, loc, vio);
+    const mitigationText = appendMitigation(mitigation, punishmentNote);
 
     // 2) Log entry
     addDupeLog({
@@ -1131,7 +1458,7 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
       vt: Number.isFinite(vio?.total) ? vio.total : undefined,
       vty: Number.isFinite(vio?.typeScore) ? vio.typeScore : undefined,
       vk: vio?.key ? String(vio.key) : undefined,
-      m: String(mitigation ?? ""),
+      m: String(mitigationText ?? ""),
     });
 
     // 3) Messaging
@@ -1145,17 +1472,17 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
     if (mode === "detected") {
       broadcastMsg = `${baseTag} ${who} §7was found with §f${incidentType}§r§7: §f${itemDesc}§r.§7 Item removed.§r${noteText}`;
       adminMsg = `${baseTag} §6Admin Alert:§r ${who} §7was found with §f${incidentType}§r§7: §f${itemDesc}§r ` +
-                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby: §e${nearList}§r.${noteText}`;
+                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby Players: §e${nearList}§r.${noteText}`;
     } else {
       broadcastMsg = `${baseTag} ${who} §7attempted a §f${incidentType}§r §7with §f${itemDesc}§r.§r${noteText}`;
       adminMsg = `${baseTag} §6Admin Alert:§r ${who} §7attempted a §f${incidentType}§r §7with §f${itemDesc}§r ` +
-                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby: §e${nearList}§r.${noteText}`;
+                 `§7at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r\n§7Nearby Players: §e${nearList}§r.${noteText}`;
     }
 
     for (const p of getPlayersSafe()) {
       if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
         try { p.sendMessage(broadcastMsg); } catch (e) {
-          dbgWarn("alerts", `Failed public message send: ${e}`);
+          dbgWarn("alerts", `Unable to send public message: ${e}`);
         }
       }
     }
@@ -1164,7 +1491,7 @@ function reportIncident(offender, incidentType, itemDesc, loc, mitigation = "", 
     dbgInfo("incident", `${name} | ${mode} | ${incidentType} | ${itemDesc} | ${dimId} @ ${coordStr}`);
   } catch (e) {
     console.warn(`[Anti-Dupe] reportIncident failed: ${e}`);
-    dbgError("incident", `reportIncident failed: ${e}`);
+    dbgError("incident", `reportIncident error: ${e}`);
   }
 }
 
@@ -1176,16 +1503,16 @@ function alertDetected(offender, incidentType, itemDesc, loc, mitigation = "", m
   reportIncident(offender, incidentType, itemDesc, loc, mitigation, "detected", messageNote);
 }
 
-// -----------------------------
-// Ghost Stack Patch (GLOBAL CONFIG CONTROLLED)
-// -----------------------------
+// --- Ghost Stack Patch ---
 world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   try {
     if (!initialSpawn || !player) return;
 
+    migrateViolationScoresForPlayer(player);
+
     if (!configLoaded) loadGlobalConfig();
     if (!globalConfig.ghostPatch) {
-      dbgOncePer("ghost_disabled", 600, "info", "ghost", "Ghost Stack Patch is disabled (config).");
+      dbgOncePer("ghost_disabled", 600, "info", "ghost", "Ghost Stack Patch is disabled (configuration).");
       return;
     }
 
@@ -1203,11 +1530,11 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
       try {
         player.dimension.spawnItem(new ItemStack(held.typeId, 1), player.location);
       } catch (e) {
-        dbgWarn("ghost", `Failed to spawnItem in ghost patch: ${e}`);
+        dbgWarn("ghost", `Unable to spawn item in ghost patch: ${e}`);
       }
 
       try { cursor.clear(); } catch (e) {
-        dbgWarn("ghost", `Failed to clear cursor inventory: ${e}`);
+        dbgWarn("ghost", `Unable to clear cursor inventory: ${e}`);
       }
 
       alertDupe(
@@ -1218,7 +1545,7 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
         "Cursor cleared; 1 item dropped; ghost stack prevented."
       );
     } else {
-      dbgOncePer("ghost_no_action", 600, "info", "ghost", "Ghost spawn check ran with no action required.");
+      dbgOncePer("ghost_no_action", 600, "info", "ghost", "Ghost spawn check completed; no action required.");
     }
   } catch (e) {
     console.warn(`[Anti-Dupe] Ghost patch error: ${e}`);
@@ -1226,9 +1553,7 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
   }
 });
 
-// -----------------------------
-// Illegal Stack Size Enforcement (GLOBAL CONFIG CONTROLLED)
-// -----------------------------
+// --- Illegal Stack Size Enforcement ---
 function isIllegalAmount(amount, maxAmount) {
   if (!Number.isFinite(amount)) return true;
   if (amount <= 0) return true; // catches "beneath 0" and 0
@@ -1255,7 +1580,7 @@ function enforceIllegalStacksForPlayer(player) {
 
     if (!configLoaded) loadGlobalConfig();
     if (!globalConfig.illegalStackPatch) {
-      dbgOncePer("illegal_disabled", 600, "info", "illegal", "Illegal Stack Patch is disabled (config).");
+      dbgOncePer("illegal_disabled", 600, "info", "illegal", "Illegal Stack Patch is disabled (configuration).");
       return;
     }
 
@@ -1294,7 +1619,7 @@ function enforceIllegalStacksForPlayer(player) {
         }
       }
     } catch (e) {
-      dbgWarn("illegal", `Cursor scan failed: ${e}`);
+      dbgWarn("illegal", `Cursor scan error: ${e}`);
     }
 
     if (!findings.length) return;
@@ -1313,7 +1638,7 @@ function enforceIllegalStacksForPlayer(player) {
     dbgWarn("illegal", `Removed illegal stacks from ${player.nameTag ?? player.name ?? "player"}: ${summary}`);
   } catch (e) {
     console.warn(`[Anti-Dupe] Illegal stack enforcement failed: ${e}`);
-    dbgError("illegal", `Illegal stack enforcement failed: ${e}`);
+    dbgError("illegal", `Illegal stack enforcement error: ${e}`);
   }
 }
 
@@ -1326,11 +1651,9 @@ system.runInterval(() => {
   }
 }, ILLEGAL_STACK_SCAN_TICKS);
 
-// -----------------------------
-// Optimised Scanner (Generator) - GLOBAL CONFIG CONTROLLED
-// -----------------------------
+// --- Scanner ---
 function* mainScanner() {
-  dbgInfo("scanner", "Main scanner started.");
+  dbgInfo("scanner", "Scanner started.");
 
   while (true) {
     const players = getPlayersSafe();
@@ -1339,7 +1662,7 @@ function* mainScanner() {
 
     const scanAny = !!(globalConfig.plantPatch || globalConfig.hopperPatch || globalConfig.dropperPatch);
     if (!scanAny) {
-      dbgOncePer("scanner_disabled", 600, "info", "scanner", "Scanner loop active but all scan patches are disabled.");
+    dbgOncePer("scanner_disabled", 600, "info", "scanner", "Scanner loop active, but all scan patches are disabled.");
       yield "FRAME_END";
       continue;
     }
@@ -1407,9 +1730,7 @@ system.runInterval(() => {
   }
 }, 1);
 
-// -----------------------------
-// Patch Handlers
-// -----------------------------
+// --- Patch Handlers ---
 function processPlantCheck(player, dim, plantBlock, pos) {
   // USER-FACING TYPE: "Piston Dupe"
   for (const o of PISTON_OFFSETS) {
@@ -1434,7 +1755,7 @@ function processPlantCheck(player, dim, plantBlock, pos) {
             "Nearby piston removed."
           );
         } else {
-          dbgError("plant", `Failed to remove piston @ ${bx},${pos.y},${bz}`);
+          dbgError("plant", `Unable to remove piston @ ${bx},${pos.y},${bz}`);
         }
       }
     }
@@ -1453,7 +1774,7 @@ function processHopperCheck(player, block, pos) {
   }
 
   if (!restrictedItemsSet || restrictedItemsSet.size === 0) {
-    dbgOncePer("hopper_no_restrict", 600, "warn", "hopper", "Restricted item list is empty; hopper patch will do nothing.");
+    dbgOncePer("hopper_no_restrict", 600, "warn", "hopper", "Restricted item list is empty; hopper patch is inactive.");
     return;
   }
 
@@ -1495,7 +1816,7 @@ function processDropperCheck(player, dim, block, pos) {
   }
 
   if (!restrictedItemsSet || restrictedItemsSet.size === 0) {
-    dbgOncePer("dropper_no_restrict", 600, "warn", "dropper", "Restricted item list is empty; dropper patch will do nothing.");
+    dbgOncePer("dropper_no_restrict", 600, "warn", "dropper", "Restricted item list is empty; dropper patch is inactive.");
     return;
   }
 
@@ -1512,7 +1833,7 @@ function processDropperCheck(player, dim, block, pos) {
       try {
         dim.spawnItem(stack, { x: pos.x + 0.5, y: pos.y + 1.2, z: pos.z + 0.5 });
       } catch (e) {
-        dbgWarn("dropper", `spawnItem failed during ejection: ${e}`);
+        dbgWarn("dropper", `spawnItem error during ejection: ${e}`);
       }
 
       clearContainerSlot(cont, slot);
@@ -1533,9 +1854,7 @@ function processDropperCheck(player, dim, block, pos) {
   }
 }
 
-// -----------------------------
-// UI Handling
-// -----------------------------
+// --- UI Handling ---
 async function ForceOpen(player, form, timeout = 1200) {
   try {
     const start = system.currentTick;
@@ -1543,19 +1862,17 @@ async function ForceOpen(player, form, timeout = 1200) {
       const response = await form.show(player);
       if (response.cancelationReason !== "UserBusy") return response;
     }
-    dbgWarn("ui", "ForceOpen timed out (player stayed busy).");
+    dbgWarn("ui", "ForceOpen timed out (player remained busy).");
     return undefined;
   } catch (e) {
-    dbgError("ui", `ForceOpen failed: ${e}`);
+    dbgError("ui", `ForceOpen error: ${e}`);
     return undefined;
   }
 }
 
-// -----------------------------
-// LOGS UI
-// -----------------------------
+// --- Logs UI ---
 function openLogsMenu(player) {
-  dbgInfo("ui", "Opened Logs menu.");
+  dbgInfo("ui", "Opened Logs Menu.");
 
   const form = new ActionFormData()
     .title("Logs")
@@ -1576,7 +1893,7 @@ function openIncidentLogsMenu(player) {
   const total = dupeLogs.length;
   const recent = getMostRecentIncidentSummary();
 
-  dbgInfo("ui", "Opened Incident Logs menu.");
+  dbgInfo("ui", "Opened Incident Logs Menu.");
 
   const form = new ActionFormData()
     .title("Incident Logs")
@@ -1612,7 +1929,7 @@ function openIncidentLogViewer(player) {
 }
 
 function confirmClearIncidentLogs(player) {
-  dbgWarn("ui", "Opened Clear Incident Logs confirmation.");
+  dbgWarn("ui", "Opened Clear Incident Logs Confirmation.");
 
   const form = new MessageFormData()
     .title("Clear Incident Logs")
@@ -1625,24 +1942,23 @@ function confirmClearIncidentLogs(player) {
     if (res.selection === 1) {
       dupeLogs = [];
       queueSaveLogs();
-      try { player.sendMessage("§aIncident logs cleared."); } catch {}
+      try { player.sendMessage("§aIncident Logs Cleared."); } catch {}
       dbgWarn("logs", "Incident logs cleared by admin.");
       openIncidentLogsMenu(player);
     }
   });
 }
 
-// -----------------------------
-// VIOLATIONS UI
-// -----------------------------
+// --- Violations UI ---
 function openViolationsDashboard(player) {
   if (!vioStatsLoaded) loadVioStats();
   ensureViolationObjectives();
 
-  dbgInfo("ui", "Opened Violations dashboard.");
+  dbgInfo("ui", "Opened Violations Dashboard.");
 
   const { key: mostKey, count: mostCount } = getMostUsedViolationType();
   const mr = vioStats?.mostRecent ?? { t: "", player: "", type: "" };
+  const mrTime = mr.t ? formatIsoUtcSplit(mr.t).combined : "";
 
   const globalCount = Number.isFinite(vioStats.globalCount) ? vioStats.globalCount : 0;
   const { rows, note } = getViolationsTable();
@@ -1651,13 +1967,13 @@ function openViolationsDashboard(player) {
   lines.push("§lViolation Dashboard§r");
   lines.push("");
   lines.push(`§7Global Violation Count:§r §e${globalCount}§r`);
-  lines.push(`§7Most Recent Violation:§r ${mr.player ? `§f${mr.player}§r §7—§r §f${mr.type}§r` : "§8None§r"}`);
+  lines.push(`§7Most Recent Violation:§r ${mr.player ? `§f${mr.player}§r §7—§r §f${mr.type}§r${mrTime ? ` §7@§r §f${mrTime}§r` : ""}` : "§8None§r"}`);
   lines.push(`§7Most Used Violation:§r ${mostKey !== "None" ? `§f${prettyTypeKey(mostKey)}§r §7(${mostCount})§r` : "§8None§r"}`);
   lines.push("");
 
   const tc = vioStats.typeCounts ?? {};
   lines.push("§lType Totals§r");
-  lines.push(`§7Ghost:§r ${tc.ghost ?? 0}  §7Piston:§r ${tc.plant ?? 0}  §7Hopper:§r ${tc.hopper ?? 0}  §7Dropper:§r ${tc.dropper ?? 0}  §7Other:§r ${tc.other ?? 0}`);
+  lines.push(`§7Ghost:§r ${tc.ghost ?? 0}  §7Piston:§r ${tc.plant ?? 0}  §7Hopper:§r ${tc.hopper ?? 0}  §7Dropper:§r ${tc.dropper ?? 0}  §7Illegal:§r ${tc.illegal ?? 0}  §7Other:§r ${tc.other ?? 0}`);
   lines.push("");
 
   if (note) {
@@ -1676,7 +1992,7 @@ function openViolationsDashboard(player) {
     for (const r of shown) {
       lines.push(
         `${idx}) §f${r.name}§r — §e${r.total}§r ` +
-        `§7(G:${r.ghost} P:${r.plant} H:${r.hopper} D:${r.dropper} O:${r.other})§r`
+        `§7(G:${r.ghost} P:${r.plant} H:${r.hopper} D:${r.dropper} I:${r.illegal} O:${r.other})§r`
       );
       idx++;
     }
@@ -1699,11 +2015,9 @@ function openViolationsDashboard(player) {
   });
 }
 
-// -----------------------------
-// SETTINGS UI (Configuration + Restricted Items + Personal Settings)
-// -----------------------------
+// --- Settings UI ---
 function openSettingsMenu(player) {
-  dbgInfo("ui", "Opened Settings menu.");
+  dbgInfo("ui", "Opened Settings Menu.");
 
   const form = new ActionFormData()
     .title("Settings")
@@ -1721,18 +2035,195 @@ function openSettingsMenu(player) {
   });
 }
 
+// --- Punishments UI ---
+function getPunishmentSummaryLines() {
+  if (!configLoaded) loadGlobalConfig();
+  const punish = globalConfig.punishments;
+
+  const status = punish?.enabled ? "Enabled" : "Disabled";
+  const kickStatus = punish?.allowKick ? "Allowed" : "Not Allowed";
+  const bypass = punish?.bypassTag ? punish.bypassTag : "None";
+
+  return [
+    `Status: ${status}`,
+    `Kick Actions: ${kickStatus}`,
+    `Bypass Tag: ${bypass}`,
+  ];
+}
+
+function openPunishmentsMenu(player) {
+  if (!configLoaded) loadGlobalConfig();
+  dbgInfo("ui", "Opened Punishments Menu.");
+
+  const form = new ActionFormData()
+    .title("Punishments")
+    .body(getPunishmentSummaryLines().join("\n"))
+    .button("Global Options")
+    .button("Configure Dupe Types")
+    .button("Back");
+
+  ForceOpen(player, form)
+    .then((res) => {
+      if (!res || res.canceled) return;
+      if (res.selection === 0) openPunishmentGlobalOptionsForm(player);
+      else if (res.selection === 1) openPunishmentTypeMenu(player);
+      else openMainMenu(player);
+    })
+    .catch((e) => dbgError("ui", `Punishments menu failed: ${e}`));
+}
+
+function openPunishmentGlobalOptionsForm(player) {
+  try {
+    if (!configLoaded) loadGlobalConfig();
+    dbgInfo("ui", "Opened Punishment Configuration Form.");
+
+    const punish = globalConfig.punishments;
+    const form = new ModalFormData().title("Punishment Configuration");
+    addToggleCompat(form, "Enable Punishments", !!punish.enabled);
+    addToggleCompat(form, "Allow Kick Actions", !!punish.allowKick);
+    addTextFieldCompat(form, "Bypass Tag (Optional)", "antidupe:bypass", punish.bypassTag ?? "");
+    form.slider("Kick Cooldown (Ticks)", 0, 200, 5, clampRangeInt(punish.cooldownTicks, 0, 200, 40));
+    addTextFieldCompat(
+      form,
+      "Kick Reason Template",
+      "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
+      punish.reasonTemplate ?? ""
+    );
+    addToggleCompat(form, "Public Kick Message", !!punish.publicKickMessage);
+
+    ForceOpen(player, form).then((response) => {
+      if (!response || response.canceled) return;
+      const v = response.formValues ?? [];
+
+      globalConfig = normalizeConfig({
+        ...globalConfig,
+        punishments: {
+          ...globalConfig.punishments,
+          enabled: !!v[0],
+          allowKick: !!v[1],
+          bypassTag: String(v[2] ?? ""),
+          cooldownTicks: clampRangeInt(v[3], 0, 200, globalConfig.punishments.cooldownTicks),
+          reasonTemplate: String(v[4] ?? ""),
+          publicKickMessage: !!v[5],
+          types: globalConfig.punishments.types,
+        },
+      });
+
+      queueSaveGlobalConfig();
+      try { player.sendMessage("§aPunishment Configuration Updated."); } catch {}
+      openPunishmentsMenu(player);
+    }).catch((e) => dbgError("ui", `Punishment configuration submit failed: ${e}`));
+  } catch (e) {
+    dbgError("ui", `Punishments form build failed: ${e}`);
+    openPunishmentsMenu(player);
+  }
+}
+
+function formatPunishmentTypeSummary(key) {
+  const types = globalConfig.punishments?.types ?? {};
+  const t = types[key] ?? {};
+  const enabled = t.enabled ? "Enabled" : "Disabled";
+  const threshold = Number.isFinite(t.threshold) && t.threshold > 0 ? t.threshold : "Disabled";
+  const tag = t.tag ? t.tag : "None";
+  const kickAt = t.kickAtThreshold ? "On" : "Off";
+  const kickRepeat = t.kickIfTaggedOnRepeat ? "On" : "Off";
+  return `${prettyTypeKey(key)} — ${enabled} | Threshold: ${threshold} | Tag: ${tag} | Kick At Threshold: ${kickAt} | Kick If Tagged: ${kickRepeat}`;
+}
+
+function openPunishmentTypeMenu(player) {
+  if (!configLoaded) loadGlobalConfig();
+  dbgInfo("ui", "Opened Punishment Type Menu.");
+
+  const lines = [
+    formatPunishmentTypeSummary("ghost"),
+    formatPunishmentTypeSummary("plant"),
+    formatPunishmentTypeSummary("hopper"),
+    formatPunishmentTypeSummary("dropper"),
+    formatPunishmentTypeSummary("illegal"),
+    formatPunishmentTypeSummary("other"),
+  ];
+
+  const form = new ActionFormData()
+    .title("Dupe Type Rules")
+    .body(lines.join("\n"))
+    .button("Ghost Stack")
+    .button("Piston")
+    .button("Hopper")
+    .button("Dropper")
+    .button("Illegal Stack")
+    .button("Other")
+    .button("Back");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res || res.canceled) return;
+    if (res.selection === 0) openPunishmentTypeForm(player, "ghost");
+    else if (res.selection === 1) openPunishmentTypeForm(player, "plant");
+    else if (res.selection === 2) openPunishmentTypeForm(player, "hopper");
+    else if (res.selection === 3) openPunishmentTypeForm(player, "dropper");
+    else if (res.selection === 4) openPunishmentTypeForm(player, "illegal");
+    else if (res.selection === 5) openPunishmentTypeForm(player, "other");
+    else openPunishmentsMenu(player);
+  });
+}
+
+function openPunishmentTypeForm(player, key) {
+  try {
+    if (!configLoaded) loadGlobalConfig();
+    const typeSettings = globalConfig.punishments?.types?.[key] ?? {};
+    const title = `Rule: ${prettyTypeKey(key)}`;
+
+    const form = new ModalFormData().title(title);
+    addToggleCompat(form, "Enabled", !!typeSettings.enabled);
+    form.slider("Threshold (0 = Disabled)", 0, 20, 1, clampRangeInt(typeSettings.threshold, 0, 20, 0));
+    addTextFieldCompat(form, "Violator Tag (Optional)", "antidupe:violator", typeSettings.tag ?? "");
+    addToggleCompat(form, "Kick At Threshold", !!typeSettings.kickAtThreshold);
+    addToggleCompat(form, "Kick If Tagged On Repeat", !!typeSettings.kickIfTaggedOnRepeat);
+
+    ForceOpen(player, form).then((response) => {
+      if (!response || response.canceled) return;
+      const v = response.formValues ?? [];
+
+      const updatedTypes = {
+        ...globalConfig.punishments.types,
+        [key]: {
+          ...globalConfig.punishments.types[key],
+          enabled: !!v[0],
+          threshold: clampRangeInt(v[1], 0, 20, 0),
+          tag: String(v[2] ?? ""),
+          kickAtThreshold: !!v[3],
+          kickIfTaggedOnRepeat: !!v[4],
+        },
+      };
+
+      globalConfig = normalizeConfig({
+        ...globalConfig,
+        punishments: {
+          ...globalConfig.punishments,
+          types: updatedTypes,
+        },
+      });
+
+      queueSaveGlobalConfig();
+      try { player.sendMessage(`§aPunishment Rule Updated: §f${prettyTypeKey(key)}`); } catch {}
+      openPunishmentTypeMenu(player);
+    }).catch((e) => dbgError("ui", `Punishment rule submit failed: ${e}`));
+  } catch (e) {
+    dbgError("ui", `Punishments form build failed: ${e}`);
+    openPunishmentsMenu(player);
+  }
+}
+
 function openConfigurationForm(player) {
   if (!configLoaded) loadGlobalConfig();
 
-  dbgInfo("ui", "Opened Configuration form.");
+  dbgInfo("ui", "Opened Configuration Form.");
 
-  const form = new ModalFormData()
-    .title("Configuration (World)")
-    .toggle("Ghost Stack Patch",    !!globalConfig.ghostPatch)
-    .toggle("Piston Dupe Patch",    !!globalConfig.plantPatch)
-    .toggle("Hopper Dupe Patch",    !!globalConfig.hopperPatch)
-    .toggle("Dropper Dupe Patch",   !!globalConfig.dropperPatch)
-    .toggle("Illegal Stack Patch",  !!globalConfig.illegalStackPatch);
+  const form = new ModalFormData().title("Configuration (World)");
+  addToggleCompat(form, "Ghost Stack Patch", !!globalConfig.ghostPatch);
+  addToggleCompat(form, "Piston Dupe Patch", !!globalConfig.plantPatch);
+  addToggleCompat(form, "Hopper Dupe Patch", !!globalConfig.hopperPatch);
+  addToggleCompat(form, "Dropper Dupe Patch", !!globalConfig.dropperPatch);
+  addToggleCompat(form, "Illegal Stack Patch", !!globalConfig.illegalStackPatch);
 
   ForceOpen(player, form).then((response) => {
     if (!response || response.canceled) return;
@@ -1750,9 +2241,9 @@ function openConfigurationForm(player) {
 
     rebuildRestrictedItemsSet();
     queueSaveGlobalConfig();
-    dbgWarn("config", "World configuration toggles updated via UI.");
+    dbgWarn("config", "World configuration updated via UI.");
 
-    try { player.sendMessage("§aWorld configuration updated."); } catch {}
+    try { player.sendMessage("§aWorld Configuration Updated."); } catch {}
     openSettingsMenu(player);
   });
 }
@@ -1767,16 +2258,14 @@ function formatRestrictedItemsList(maxLines = 20) {
   return out;
 }
 
-// -----------------------------
-// RESTRICTED ITEMS UI (MISSING)
-// -----------------------------
+// --- Restricted Items UI ---
 function openRestrictedItemsMenu(player) {
   if (!configLoaded) loadGlobalConfig();
 
   const count = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.length : 0;
   const preview = formatRestrictedItemsList(12);
 
-  dbgInfo("ui", "Opened Restricted Items menu.");
+  dbgInfo("ui", "Opened Restricted Items Menu.");
 
   const form = new ActionFormData()
     .title("Restricted Items (World)")
@@ -1797,13 +2286,13 @@ function openRestrictedItemsMenu(player) {
       else if (res.selection === 3) confirmResetRestrictedItems(player);
       else openSettingsMenu(player);
     })
-    .catch((e) => dbgError("ui", `Restricted Items menu crashed: ${e}`));
+    .catch((e) => dbgError("ui", `Restricted Items menu failed: ${e}`));
 }
 
 function openRestrictedItemsViewer(player) {
   if (!configLoaded) loadGlobalConfig();
 
-  dbgInfo("ui", "Opened Restricted Items viewer.");
+  dbgInfo("ui", "Opened Restricted Items Viewer.");
 
   const body = formatRestrictedItemsList(80);
 
@@ -1818,34 +2307,50 @@ function openRestrictedItemsViewer(player) {
       if (!res || res.canceled) return;
       if (res.selection === 1) openRestrictedItemsMenu(player);
     })
-    .catch((e) => dbgError("ui", `Restricted Items viewer crashed: ${e}`));
+    .catch((e) => dbgError("ui", `Restricted Items viewer failed: ${e}`));
 }
-
-
-// -----------------------------
-// UI Compat: ModalFormData.textField signature changed across versions
-// - Older: textField(label, placeholder?, defaultValue?)
-// - Newer: textField(label, placeholder?, options?: ModalFormDataTextFieldOptions)
-// This wrapper prevents native type conversion errors.
-// -----------------------------
-
+// ModalFormData.textField compatibility wrapper.
 function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
-  // Most compatible: 2 args (works on modern + legacy)
+  // Two-argument form works across versions.
   try {
     form.textField(label, placeholder);
     return form;
   } catch (e2) {
-    // Newer overload: options object
+    // Newer overload: options object.
     try {
       form.textField(label, placeholder, { defaultValue: String(defaultValue ?? "") });
       return form;
     } catch (e3) {
-      // Legacy overload: defaultValue string
+      // Legacy overload: defaultValue string.
       try {
         form.textField(label, placeholder, String(defaultValue ?? ""));
         return form;
       } catch (e4) {
-        dbgError("ui", `textField attach failed: ${e2} | ${e3} | ${e4}`);
+        dbgError("ui", `Unable to attach text field: ${e2} | ${e3} | ${e4}`);
+        return form;
+      }
+    }
+  }
+}
+
+// ModalFormData.toggle compatibility wrapper.
+function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
+  try {
+    form.toggle(label);
+    return form;
+  } catch (e1) {
+    try {
+      const opts = { defaultValue: !!defaultValue };
+      const tip = String(tooltip ?? "").trim();
+      if (tip) opts.tooltip = tip;
+      form.toggle(label, opts);
+      return form;
+    } catch (e2) {
+      try {
+        form.toggle(label, !!defaultValue);
+        return form;
+      } catch (e3) {
+        dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
         return form;
       }
     }
@@ -1855,10 +2360,10 @@ function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
 
 
 function openAddRestrictedItemForm(player) {
-  dbgInfo("ui", "Opened Add Restricted Item form.");
+  dbgInfo("ui", "Opened Add Restricted Item Form.");
 
   const form = new ModalFormData().title("Add Restricted Item");
-  addTextFieldCompat(form, "Enter item id (namespace:item)", "minecraft:bundle", "");
+  addTextFieldCompat(form, "Enter Item ID (namespace:item)", "minecraft:bundle", "");
 
   ForceOpen(player, form).then((res) => {
     if (!res || res.canceled) return;
@@ -1866,13 +2371,13 @@ function openAddRestrictedItemForm(player) {
     const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
     if (!raw) {
       dbgWarn("restrict", "Add restricted item: empty input.");
-      try { player.sendMessage("§cInvalid input: empty item id."); } catch {}
+      try { player.sendMessage("§cInvalid input: empty Item ID."); } catch {}
       return openRestrictedItemsMenu(player);
     }
 
     if (!isValidNamespacedId(raw)) {
-      dbgWarn("restrict", `Add restricted item: invalid id format: ${raw}`);
-      try { player.sendMessage("§cInvalid item id. Use namespace:item (e.g., minecraft:bundle)."); } catch {}
+      dbgWarn("restrict", `Add restricted item: invalid ID format: ${raw}`);
+      try { player.sendMessage("§cInvalid Item ID. Use namespace:item (e.g., minecraft:bundle)."); } catch {}
       return openRestrictedItemsMenu(player);
     }
 
@@ -1899,8 +2404,8 @@ function openAddRestrictedItemForm(player) {
     rebuildRestrictedItemsSet();
     queueSaveGlobalConfig();
 
-    dbgWarn("restrict", `Added restricted item: ${raw}`);
-    try { player.sendMessage(`§aAdded restricted item: §f${raw}`); } catch {}
+    dbgWarn("restrict", `Restricted item added: ${raw}`);
+    try { player.sendMessage(`§aRestricted Item Added: §f${raw}`); } catch {}
 
     openRestrictedItemsMenu(player);
   });
@@ -1908,14 +2413,14 @@ function openAddRestrictedItemForm(player) {
 
 
 function openRemoveRestrictedItemForm(player) {
-  dbgInfo("ui", "Opened Remove Restricted Item form.");
+  dbgInfo("ui", "Opened Remove Restricted Item Form.");
 
   const preview = formatRestrictedItemsList(10);
   const form = new ModalFormData().title("Remove Restricted Item");
 
   addTextFieldCompat(
     form,
-    `Enter item id to remove\n\nPreview:\n${preview}`,
+    `Enter Item ID to Remove\n\nPreview:\n${preview}`,
     "minecraft:bundle",
     ""
   );
@@ -1926,7 +2431,7 @@ function openRemoveRestrictedItemForm(player) {
     const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
     if (!raw) {
       dbgWarn("restrict", "Remove restricted item: empty input.");
-      try { player.sendMessage("§cInvalid input: empty item id."); } catch {}
+      try { player.sendMessage("§cInvalid input: empty Item ID."); } catch {}
       return openRestrictedItemsMenu(player);
     }
 
@@ -1949,8 +2454,8 @@ function openRemoveRestrictedItemForm(player) {
     rebuildRestrictedItemsSet();
     queueSaveGlobalConfig();
 
-    dbgWarn("restrict", `Removed restricted item: ${raw}`);
-    try { player.sendMessage(`§aRemoved restricted item: §f${raw}`); } catch {}
+    dbgWarn("restrict", `Restricted item removed: ${raw}`);
+    try { player.sendMessage(`§aRestricted Item Removed: §f${raw}`); } catch {}
 
     openRestrictedItemsMenu(player);
   });
@@ -1958,7 +2463,7 @@ function openRemoveRestrictedItemForm(player) {
 
 
 function confirmResetRestrictedItems(player) {
-  dbgWarn("ui", "Opened Restricted Items reset confirmation.");
+  dbgWarn("ui", "Opened Restricted Items Reset Confirmation.");
 
   const form = new MessageFormData()
     .title("Reset Restricted Items")
@@ -1979,7 +2484,7 @@ function confirmResetRestrictedItems(player) {
       queueSaveGlobalConfig();
 
       dbgWarn("restrict", "Restricted item list reset to defaults.");
-      try { player.sendMessage("§aRestricted items reset to defaults."); } catch {}
+      try { player.sendMessage("§aRestricted Items Reset to Defaults."); } catch {}
 
       openRestrictedItemsMenu(player);
     } else {
@@ -1989,13 +2494,12 @@ function confirmResetRestrictedItems(player) {
 }
 
 function openPersonalSettingsForm(player) {
-  dbgInfo("ui", "Opened Personal Settings form.");
+  dbgInfo("ui", "Opened Personal Settings Form.");
 
-  const form = new ModalFormData()
-    .title("Personal Settings (Admin)")
-    .toggle("Public Messages",       !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG))
-    .toggle("Admin Messages",        !player.hasTag?.(DISABLE_ADMIN_MSG_TAG))
-    .toggle("Admin Alerts (Coords)", !player.hasTag?.(DISABLE_ALERT_TAG));
+  const form = new ModalFormData().title("Personal Settings (Admin)");
+  addToggleCompat(form, "Public Messages", !player.hasTag?.(DISABLE_PUBLIC_MSG_TAG));
+  addToggleCompat(form, "Admin Messages", !player.hasTag?.(DISABLE_ADMIN_MSG_TAG));
+  addToggleCompat(form, "Admin Alerts (Coordinates)", !player.hasTag?.(DISABLE_ALERT_TAG));
 
   ForceOpen(player, form).then((response) => {
     if (!response || response.canceled) return;
@@ -2014,14 +2518,12 @@ function openPersonalSettingsForm(player) {
     });
 
     dbgInfo("ui", "Personal settings updated (tags toggled).");
-    try { player.sendMessage("§aPersonal settings updated."); } catch {}
+    try { player.sendMessage("§aPersonal Settings Updated."); } catch {}
     openSettingsMenu(player);
   });
 }
 
-// -----------------------------
-// DEBUG UI (Runtime Only)
-// -----------------------------
+// --- Debug UI (Runtime Only) ---
 function formatDebugEntry(e) {
   const lvl = (e?.lvl ?? "info").toUpperCase();
   const area = e?.area ?? "core";
@@ -2033,12 +2535,12 @@ function formatDebugEntry(e) {
 
 function formatDebugLogText(maxEntries = 50) {
   const total = debugLog.length;
-  if (!total) return "No debug entries (runtime).";
+  if (!total) return "No debug entries available (runtime).";
 
   const newestFirst = [...debugLog].reverse().slice(0, maxEntries);
   const blocks = newestFirst.map(formatDebugEntry);
 
-  let out = `Debug Log (${Math.min(total, maxEntries)}/${total} shown)\n\n`;
+  let out = `Debug Log (${Math.min(total, maxEntries)}/${total} Shown)\n\n`;
   out += blocks.join("\n\n---\n\n");
 
   if (total > maxEntries) out += `\n\n---\n\nNote: ${total - maxEntries} older entries not shown.`;
@@ -2056,9 +2558,9 @@ function getRuntimeStatusText() {
   lines.push("");
   lines.push(`Tick: ${system.currentTick}`);
   lines.push(`Persistence Enabled: ${persistenceEnabled}`);
-  lines.push(`Config Loaded: ${configLoaded}`);
-  lines.push(`Logs Loaded: ${logsLoaded}`);
-  lines.push(`Violations Loaded: ${vioStatsLoaded}`);
+  lines.push(`Configuration Loaded: ${configLoaded}`);
+  lines.push(`Incident Logs Loaded: ${logsLoaded}`);
+  lines.push(`Violation Stats Loaded: ${vioStatsLoaded}`);
   lines.push(`Violation Objectives Ready: ${vioObjectivesReady}`);
   lines.push(`Scoreboard Available: ${!!world.scoreboard}`);
   lines.push("");
@@ -2069,10 +2571,10 @@ function getRuntimeStatusText() {
   lines.push(`- Dropper Dupe Patch: ${!!globalConfig.dropperPatch}`);
   lines.push(`- Illegal Stack Patch: ${!!globalConfig.illegalStackPatch}`);
   lines.push("");
-  lines.push(`Scanner Enabled (any): ${scanAny}`);
-  lines.push(`Restricted Item Count: ${restrictedCount} (set size=${restrictedItemsSet?.size ?? 0})`);
+  lines.push(`Scanner Enabled (Any): ${scanAny}`);
+  lines.push(`Restricted Item Count: ${restrictedCount} (Set Size=${restrictedItemsSet?.size ?? 0})`);
   lines.push("");
-  lines.push("Debug Counters (runtime):");
+  lines.push("Debug Counters (Runtime):");
   lines.push(`- Info: ${debugCounters.info}`);
   lines.push(`- Warn: ${debugCounters.warn}`);
   lines.push(`- Error: ${debugCounters.error}`);
@@ -2082,7 +2584,7 @@ function getRuntimeStatusText() {
 }
 
 function openDebugMenu(player) {
-  dbgInfo("ui", "Opened Debug menu.");
+  dbgInfo("ui", "Opened Debug Menu.");
 
   const last = debugLog.length ? debugLog[debugLog.length - 1] : null;
   const lastLine = last ? `[${String(last.lvl).toUpperCase()}] ${last.area}: ${last.msg}` : "None";
@@ -2155,35 +2657,33 @@ function confirmClearDebugLog(player) {
       debugCounters = { info: 0, warn: 0, error: 0 };
       debugLastByKey = Object.create(null);
       dbgWarn("debug", "Debug log cleared by admin.");
-      try { player.sendMessage("§aDebug log cleared."); } catch {}
+      try { player.sendMessage("§aDebug Log Cleared."); } catch {}
     }
     openDebugMenu(player);
   });
 }
 
-// -----------------------------
-// MAIN MENU (Settings / Logs / Debug)
-// -----------------------------
+// --- Main Menu ---
 function openMainMenu(player) {
-  dbgInfo("ui", "Opened Main menu.");
+  dbgInfo("ui", "Opened Main Menu.");
 
   const menu = new ActionFormData()
     .title("Anti-Dupe")
     .button("Settings")
     .button("Logs")
+    .button("Punishments")
     .button("Debug");
 
   ForceOpen(player, menu).then((res) => {
     if (!res || res.canceled) return;
     if (res.selection === 0) openSettingsMenu(player);
     else if (res.selection === 1) openLogsMenu(player);
+    else if (res.selection === 2) openPunishmentsMenu(player);
     else openDebugMenu(player);
   });
 }
 
-// -----------------------------
-// Menu Activation (Admin holds SETTINGS_ITEM)
-// -----------------------------
+// --- Menu Activation ---
 world.beforeEvents.itemUse.subscribe((event) => {
   try {
     const source = event.source;
@@ -2198,11 +2698,11 @@ world.beforeEvents.itemUse.subscribe((event) => {
       openMainMenu(source);
     });
   } catch (e) {
-    dbgError("ui", `itemUse menu open failed: ${e}`);
+    dbgError("ui", `itemUse menu open error: ${e}`);
   }
 });
 
-// Optional menu open via block hit (mining triggers this too — safe guarded)
+// Optional menu open via block hit (mining can trigger this; guarded).
 world.afterEvents.entityHitBlock.subscribe((event) => {
   try {
     const p = event.damagingEntity;
@@ -2217,6 +2717,6 @@ world.afterEvents.entityHitBlock.subscribe((event) => {
 
     if (item?.typeId === SETTINGS_ITEM) openMainMenu(p);
   } catch (e) {
-    dbgWarn("ui", `entityHitBlock handler failed: ${e}`);
+    dbgWarn("ui", `entityHitBlock handler error: ${e}`);
   }
 });
