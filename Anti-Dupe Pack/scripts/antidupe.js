@@ -56,6 +56,7 @@ const DEFAULT_GLOBAL_CONFIG = {
     enabled: true,
     allowKick: false,
     bypassTag: "",
+    punishmentTag: "",
     reasonTemplate: "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
     cooldownTicks: 40,
     publicKickMessage: false,
@@ -171,6 +172,22 @@ function runLater(fn, ticks = 0) {
   try { return system.run(fn); } catch (e) {
     dbgError("scheduler", `system.run error: ${e}`);
   }
+}
+
+function openNextTick(fn) {
+  runLater(() => {
+    try { fn(); } catch (e) {
+      dbgError("ui", `OpenNextTick error: ${e}`);
+      console.warn(`[Anti-Dupe] OpenNextTick error: ${e}`);
+    }
+  }, 0);
+}
+
+function notifyFormFailed(player, context) {
+  const msg = "§c[Anti-Dupe] Form failed to open. Check Debug > View Debug Log.";
+  try { player?.sendMessage?.(msg); } catch {}
+  const note = context ? ` (${context})` : "";
+  console.warn(`[Anti-Dupe] Form failed to open${note}.`);
 }
 
 function getEntityInventoryContainer(entity) {
@@ -375,7 +392,7 @@ function normalizePunishmentType(input, defaults) {
   if (!input || typeof input !== "object") return out;
 
   if ("enabled" in input) out.enabled = !!input.enabled;
-  if ("threshold" in input) out.threshold = clampRangeInt(input.threshold, 0, 20, defaults.threshold);
+  if ("threshold" in input) out.threshold = clampRangeInt(input.threshold, 0, 200, defaults.threshold);
   if ("tag" in input) {
     const t = String(input.tag ?? "").trim();
     out.tag = t.length > 32 ? t.slice(0, 32) : t;
@@ -392,6 +409,7 @@ function normalizePunishments(input) {
     enabled: defaults.enabled,
     allowKick: defaults.allowKick,
     bypassTag: defaults.bypassTag,
+    punishmentTag: defaults.punishmentTag,
     reasonTemplate: defaults.reasonTemplate,
     cooldownTicks: defaults.cooldownTicks,
     publicKickMessage: defaults.publicKickMessage,
@@ -414,6 +432,11 @@ function normalizePunishments(input) {
   if ("bypassTag" in input) {
     const t = String(input.bypassTag ?? "").trim();
     out.bypassTag = t.length > 32 ? t.slice(0, 32) : t;
+  }
+
+  if ("punishmentTag" in input) {
+    const t = String(input.punishmentTag ?? "").trim();
+    out.punishmentTag = t.length > 32 ? t.slice(0, 32) : t;
   }
 
   if ("reasonTemplate" in input) {
@@ -512,6 +535,7 @@ function safeStringifyConfigWithCap(cfg) {
       for (const k of Object.keys(temp.punishments.types)) {
         temp.punishments.types[k].tag = "";
       }
+      if (temp.punishments.punishmentTag) temp.punishments.punishmentTag = "";
       tagsCleared = true;
       continue;
     }
@@ -1019,17 +1043,19 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
     const typeSettings = punish.types?.[key] ?? punish.types?.other;
     if (!typeSettings?.enabled) return "";
 
-    const threshold = clampRangeInt(typeSettings.threshold, 0, 20, 0);
+    const threshold = clampRangeInt(typeSettings.threshold, 0, 200, 0);
     if (threshold <= 0) return "";
 
     const typeLabel = prettyTypeKey(key);
     const typeScore = Number.isFinite(vio?.typeScore) ? vio.typeScore : 0;
 
     let mitigationNote = "";
-    const tag = String(typeSettings.tag ?? "").trim();
+    const typeTag = String(typeSettings.tag ?? "").trim();
+    const globalTag = String(punish.punishmentTag ?? "").trim();
+    const effectiveTag = typeTag || globalTag;
 
-    if (tag) {
-      if (typeSettings.kickIfTaggedOnRepeat && player.hasTag?.(tag)) {
+    if (typeTag) {
+      if (typeSettings.kickIfTaggedOnRepeat && player.hasTag?.(typeTag)) {
         if (punish.allowKick) {
           const now = system.currentTick;
           const last = lastPunishTickByPlayerName.get(name) ?? -999999;
@@ -1058,10 +1084,15 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
         return mitigationNote;
       }
 
-      if (!player.hasTag?.(tag)) {
-        player.addTag?.(tag);
-        mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${tag})`);
+      if (!player.hasTag?.(typeTag)) {
+        player.addTag?.(typeTag);
+        mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${typeTag})`);
       }
+    }
+
+    if (effectiveTag && typeScore >= threshold && !player.hasTag?.(effectiveTag)) {
+      player.addTag?.(effectiveTag);
+      mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${effectiveTag})`);
     }
 
     if (typeSettings.kickAtThreshold && punish.allowKick && typeScore >= threshold) {
@@ -1078,7 +1109,7 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
           const dimLabel = prettyDimension(dimId);
           const pos = player.location ?? loc;
           const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
-          const tagNote = tag ? ` Tag: ${tag}.` : "";
+          const tagNote = effectiveTag ? ` Tag: ${effectiveTag}.` : "";
           sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for §f${typeLabel}§r §7violations (${typeScore}/${threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r${tagNote}`);
           if (punish.publicKickMessage) {
             for (const p of getPlayersSafe()) {
@@ -1861,11 +1892,24 @@ async function ForceOpen(player, form, timeout = 1200) {
     while (system.currentTick - start < timeout) {
       const response = await form.show(player);
       if (response.cancelationReason !== "UserBusy") return response;
+      await new Promise((resolve) => {
+        try {
+          if (typeof system.runTimeout === "function") {
+            system.runTimeout(resolve, 2);
+          } else {
+            system.run(resolve);
+          }
+        } catch {
+          system.run(resolve);
+        }
+      });
     }
     dbgWarn("ui", "ForceOpen timed out (player remained busy).");
+    console.warn("[Anti-Dupe] ForceOpen timed out (player remained busy).");
     return undefined;
   } catch (e) {
     dbgError("ui", `ForceOpen error: ${e}`);
+    console.warn(`[Anti-Dupe] ForceOpen error: ${e}`);
     return undefined;
   }
 }
@@ -1881,10 +1925,19 @@ function openLogsMenu(player) {
     .button("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 0) openIncidentLogsMenu(player);
-    else if (res.selection === 1) openViolationsDashboard(player);
-    else openMainMenu(player);
+    if (!res) {
+      notifyFormFailed(player, "Logs Menu");
+      return openNextTick(() => openMainMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openMainMenu(player));
+    if (res.selection === 0) openNextTick(() => openIncidentLogsMenu(player));
+    else if (res.selection === 1) openNextTick(() => openViolationsDashboard(player));
+    else openNextTick(() => openMainMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Logs menu submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Logs menu submit failed: ${e}`);
+    notifyFormFailed(player, "Logs Menu");
+    openNextTick(() => openMainMenu(player));
   });
 }
 
@@ -1903,11 +1956,20 @@ function openIncidentLogsMenu(player) {
     .button("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Incident Logs Menu");
+      return openNextTick(() => openLogsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openLogsMenu(player));
 
-    if (res.selection === 0) openIncidentLogViewer(player);
-    else if (res.selection === 1) confirmClearIncidentLogs(player);
-    else openLogsMenu(player);
+    if (res.selection === 0) openNextTick(() => openIncidentLogViewer(player));
+    else if (res.selection === 1) openNextTick(() => confirmClearIncidentLogs(player));
+    else openNextTick(() => openLogsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Incident logs menu submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Incident logs menu submit failed: ${e}`);
+    notifyFormFailed(player, "Incident Logs Menu");
+    openNextTick(() => openLogsMenu(player));
   });
 }
 
@@ -1923,8 +1985,17 @@ function openIncidentLogViewer(player) {
     .button2("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 1) openIncidentLogsMenu(player);
+    if (!res) {
+      notifyFormFailed(player, "Incident Logs Viewer");
+      return openNextTick(() => openIncidentLogsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openIncidentLogsMenu(player));
+    if (res.selection === 1) openNextTick(() => openIncidentLogsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Incident logs viewer submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Incident logs viewer submit failed: ${e}`);
+    notifyFormFailed(player, "Incident Logs Viewer");
+    openNextTick(() => openIncidentLogsMenu(player));
   });
 }
 
@@ -1938,14 +2009,23 @@ function confirmClearIncidentLogs(player) {
     .button2("Clear");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Clear Incident Logs");
+      return openNextTick(() => openIncidentLogsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openIncidentLogsMenu(player));
     if (res.selection === 1) {
       dupeLogs = [];
       queueSaveLogs();
       try { player.sendMessage("§aIncident Logs Cleared."); } catch {}
       dbgWarn("logs", "Incident logs cleared by admin.");
-      openIncidentLogsMenu(player);
     }
+    openNextTick(() => openIncidentLogsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Clear incident logs submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Clear incident logs submit failed: ${e}`);
+    notifyFormFailed(player, "Clear Incident Logs");
+    openNextTick(() => openIncidentLogsMenu(player));
   });
 }
 
@@ -2010,8 +2090,17 @@ function openViolationsDashboard(player) {
     .button2("Refresh");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 1) openViolationsDashboard(player);
+    if (!res) {
+      notifyFormFailed(player, "Violations Dashboard");
+      return openNextTick(() => openLogsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openLogsMenu(player));
+    if (res.selection === 1) openNextTick(() => openViolationsDashboard(player));
+  }).catch((e) => {
+    dbgError("ui", `Violations dashboard submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Violations dashboard submit failed: ${e}`);
+    notifyFormFailed(player, "Violations Dashboard");
+    openNextTick(() => openLogsMenu(player));
   });
 }
 
@@ -2027,11 +2116,20 @@ function openSettingsMenu(player) {
     .button("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 0) openConfigurationForm(player);
-    else if (res.selection === 1) openRestrictedItemsMenu(player);
-    else if (res.selection === 2) openPersonalSettingsForm(player);
-    else openMainMenu(player);
+    if (!res) {
+      notifyFormFailed(player, "Settings Menu");
+      return openNextTick(() => openMainMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openMainMenu(player));
+    if (res.selection === 0) openNextTick(() => openConfigurationForm(player));
+    else if (res.selection === 1) openNextTick(() => openRestrictedItemsMenu(player));
+    else if (res.selection === 2) openNextTick(() => openPersonalSettingsForm(player));
+    else openNextTick(() => openMainMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Settings menu submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Settings menu submit failed: ${e}`);
+    notifyFormFailed(player, "Settings Menu");
+    openNextTick(() => openMainMenu(player));
   });
 }
 
@@ -2052,24 +2150,40 @@ function getPunishmentSummaryLines() {
 }
 
 function openPunishmentsMenu(player) {
-  if (!configLoaded) loadGlobalConfig();
-  dbgInfo("ui", "Opened Punishments Menu.");
+  try {
+    if (!configLoaded) loadGlobalConfig();
+    dbgInfo("ui", "Opened Punishments Menu.");
 
-  const form = new ActionFormData()
-    .title("Punishments")
-    .body(getPunishmentSummaryLines().join("\n"))
-    .button("Global Options")
-    .button("Configure Dupe Types")
-    .button("Back");
+    const form = new ActionFormData()
+      .title("Punishments")
+      .body(getPunishmentSummaryLines().join("\n"))
+      .button("Global Options")
+      .button("Configure Dupe Types")
+      .button("Back");
 
-  ForceOpen(player, form)
-    .then((res) => {
-      if (!res || res.canceled) return;
-      if (res.selection === 0) openPunishmentGlobalOptionsForm(player);
-      else if (res.selection === 1) openPunishmentTypeMenu(player);
-      else openMainMenu(player);
-    })
-    .catch((e) => dbgError("ui", `Punishments menu failed: ${e}`));
+    ForceOpen(player, form)
+      .then((res) => {
+        if (!res) {
+          notifyFormFailed(player, "Punishments Menu");
+          return openNextTick(() => openMainMenu(player));
+        }
+        if (res.canceled) return openNextTick(() => openMainMenu(player));
+        if (res.selection === 0) openNextTick(() => openPunishmentGlobalOptionsForm(player));
+        else if (res.selection === 1) openNextTick(() => openPunishmentTypeMenu(player));
+        else openNextTick(() => openMainMenu(player));
+      })
+      .catch((e) => {
+        dbgError("ui", `Punishments menu failed: ${e}`);
+        console.warn(`[Anti-Dupe] Punishments menu failed: ${e}`);
+        notifyFormFailed(player, "Punishments Menu");
+        openNextTick(() => openMainMenu(player));
+      });
+  } catch (e) {
+    dbgError("ui", `Punishments menu build failed: ${e}`);
+    console.warn(`[Anti-Dupe] Punishments menu build failed: ${e}`);
+    notifyFormFailed(player, "Punishments Menu");
+    openNextTick(() => openMainMenu(player));
+  }
 }
 
 function openPunishmentGlobalOptionsForm(player) {
@@ -2082,6 +2196,7 @@ function openPunishmentGlobalOptionsForm(player) {
     addToggleCompat(form, "Enable Punishments", !!punish.enabled);
     addToggleCompat(form, "Allow Kick Actions", !!punish.allowKick);
     addTextFieldCompat(form, "Bypass Tag (Optional)", "antidupe:bypass", punish.bypassTag ?? "");
+    addTextFieldCompat(form, "Global Punishment Tag (Optional)", "antidupe:punishment", punish.punishmentTag ?? "");
     form.slider("Kick Cooldown (Ticks)", 0, 200, 5, clampRangeInt(punish.cooldownTicks, 0, 200, 40));
     addTextFieldCompat(
       form,
@@ -2092,8 +2207,15 @@ function openPunishmentGlobalOptionsForm(player) {
     addToggleCompat(form, "Public Kick Message", !!punish.publicKickMessage);
 
     ForceOpen(player, form).then((response) => {
-      if (!response || response.canceled) return;
+      if (!response) {
+        notifyFormFailed(player, "Punishment Configuration");
+        return openNextTick(() => openPunishmentsMenu(player));
+      }
+      if (response.canceled) return openNextTick(() => openPunishmentsMenu(player));
       const v = response.formValues ?? [];
+      const bypassTag = String(v[2] ?? "").trim().slice(0, 32);
+      const punishmentTag = String(v[3] ?? "").trim().slice(0, 32);
+      const reasonTemplate = String(v[5] ?? "").trim().slice(0, 120);
 
       globalConfig = normalizeConfig({
         ...globalConfig,
@@ -2101,21 +2223,29 @@ function openPunishmentGlobalOptionsForm(player) {
           ...globalConfig.punishments,
           enabled: !!v[0],
           allowKick: !!v[1],
-          bypassTag: String(v[2] ?? ""),
-          cooldownTicks: clampRangeInt(v[3], 0, 200, globalConfig.punishments.cooldownTicks),
-          reasonTemplate: String(v[4] ?? ""),
-          publicKickMessage: !!v[5],
+          bypassTag,
+          punishmentTag,
+          cooldownTicks: clampRangeInt(v[4], 0, 200, globalConfig.punishments.cooldownTicks),
+          reasonTemplate,
+          publicKickMessage: !!v[6],
           types: globalConfig.punishments.types,
         },
       });
 
       queueSaveGlobalConfig();
       try { player.sendMessage("§aPunishment Configuration Updated."); } catch {}
-      openPunishmentsMenu(player);
-    }).catch((e) => dbgError("ui", `Punishment configuration submit failed: ${e}`));
+      openNextTick(() => openPunishmentsMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Punishment configuration submit failed: ${e}`);
+      console.warn(`[Anti-Dupe] Punishment configuration submit failed: ${e}`);
+      notifyFormFailed(player, "Punishment Configuration");
+      openNextTick(() => openPunishmentsMenu(player));
+    });
   } catch (e) {
     dbgError("ui", `Punishments form build failed: ${e}`);
-    openPunishmentsMenu(player);
+    console.warn(`[Anti-Dupe] Punishments form build failed: ${e}`);
+    notifyFormFailed(player, "Punishment Configuration");
+    openNextTick(() => openPunishmentsMenu(player));
   }
 }
 
@@ -2131,39 +2261,55 @@ function formatPunishmentTypeSummary(key) {
 }
 
 function openPunishmentTypeMenu(player) {
-  if (!configLoaded) loadGlobalConfig();
-  dbgInfo("ui", "Opened Punishment Type Menu.");
+  try {
+    if (!configLoaded) loadGlobalConfig();
+    dbgInfo("ui", "Opened Punishment Type Menu.");
 
-  const lines = [
-    formatPunishmentTypeSummary("ghost"),
-    formatPunishmentTypeSummary("plant"),
-    formatPunishmentTypeSummary("hopper"),
-    formatPunishmentTypeSummary("dropper"),
-    formatPunishmentTypeSummary("illegal"),
-    formatPunishmentTypeSummary("other"),
-  ];
+    const lines = [
+      formatPunishmentTypeSummary("ghost"),
+      formatPunishmentTypeSummary("plant"),
+      formatPunishmentTypeSummary("hopper"),
+      formatPunishmentTypeSummary("dropper"),
+      formatPunishmentTypeSummary("illegal"),
+      formatPunishmentTypeSummary("other"),
+    ];
 
-  const form = new ActionFormData()
-    .title("Dupe Type Rules")
-    .body(lines.join("\n"))
-    .button("Ghost Stack")
-    .button("Piston")
-    .button("Hopper")
-    .button("Dropper")
-    .button("Illegal Stack")
-    .button("Other")
-    .button("Back");
+    const form = new ActionFormData()
+      .title("Dupe Type Rules")
+      .body(lines.join("\n"))
+      .button("Ghost Stack")
+      .button("Piston")
+      .button("Hopper")
+      .button("Dropper")
+      .button("Illegal Stack")
+      .button("Other")
+      .button("Back");
 
-  ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 0) openPunishmentTypeForm(player, "ghost");
-    else if (res.selection === 1) openPunishmentTypeForm(player, "plant");
-    else if (res.selection === 2) openPunishmentTypeForm(player, "hopper");
-    else if (res.selection === 3) openPunishmentTypeForm(player, "dropper");
-    else if (res.selection === 4) openPunishmentTypeForm(player, "illegal");
-    else if (res.selection === 5) openPunishmentTypeForm(player, "other");
-    else openPunishmentsMenu(player);
-  });
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Punishment Type Menu");
+        return openNextTick(() => openPunishmentsMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openPunishmentsMenu(player));
+      if (res.selection === 0) openNextTick(() => openPunishmentTypeForm(player, "ghost"));
+      else if (res.selection === 1) openNextTick(() => openPunishmentTypeForm(player, "plant"));
+      else if (res.selection === 2) openNextTick(() => openPunishmentTypeForm(player, "hopper"));
+      else if (res.selection === 3) openNextTick(() => openPunishmentTypeForm(player, "dropper"));
+      else if (res.selection === 4) openNextTick(() => openPunishmentTypeForm(player, "illegal"));
+      else if (res.selection === 5) openNextTick(() => openPunishmentTypeForm(player, "other"));
+      else openNextTick(() => openPunishmentsMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Punishment type menu submit failed: ${e}`);
+      console.warn(`[Anti-Dupe] Punishment type menu submit failed: ${e}`);
+      notifyFormFailed(player, "Punishment Type Menu");
+      openNextTick(() => openPunishmentsMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Punishment type menu build failed: ${e}`);
+    console.warn(`[Anti-Dupe] Punishment type menu build failed: ${e}`);
+    notifyFormFailed(player, "Punishment Type Menu");
+    openNextTick(() => openPunishmentsMenu(player));
+  }
 }
 
 function openPunishmentTypeForm(player, key) {
@@ -2174,22 +2320,33 @@ function openPunishmentTypeForm(player, key) {
 
     const form = new ModalFormData().title(title);
     addToggleCompat(form, "Enabled", !!typeSettings.enabled);
-    form.slider("Threshold (0 = Disabled)", 0, 20, 1, clampRangeInt(typeSettings.threshold, 0, 20, 0));
+    addTextFieldCompat(form, "Threshold (0 = Disabled)", "0-200", String(typeSettings.threshold ?? ""));
     addTextFieldCompat(form, "Violator Tag (Optional)", "antidupe:violator", typeSettings.tag ?? "");
     addToggleCompat(form, "Kick At Threshold", !!typeSettings.kickAtThreshold);
     addToggleCompat(form, "Kick If Tagged On Repeat", !!typeSettings.kickIfTaggedOnRepeat);
 
     ForceOpen(player, form).then((response) => {
-      if (!response || response.canceled) return;
+      if (!response) {
+        notifyFormFailed(player, "Punishment Rule");
+        return openNextTick(() => openPunishmentTypeMenu(player));
+      }
+      if (response.canceled) return openNextTick(() => openPunishmentTypeMenu(player));
       const v = response.formValues ?? [];
+      const rawThreshold = parseInt(String(v[1] ?? "").trim(), 10);
+      let threshold = Number.isFinite(rawThreshold) ? rawThreshold : typeSettings.threshold;
+      if (!Number.isFinite(threshold)) {
+        threshold = 0;
+        try { player.sendMessage("§eThreshold value was invalid. Defaulting to 0."); } catch {}
+      }
+      const tagOverride = String(v[2] ?? "").trim().slice(0, 32);
 
       const updatedTypes = {
         ...globalConfig.punishments.types,
         [key]: {
           ...globalConfig.punishments.types[key],
           enabled: !!v[0],
-          threshold: clampRangeInt(v[1], 0, 20, 0),
-          tag: String(v[2] ?? ""),
+          threshold: clampRangeInt(threshold, 0, 200, 0),
+          tag: tagOverride,
           kickAtThreshold: !!v[3],
           kickIfTaggedOnRepeat: !!v[4],
         },
@@ -2205,11 +2362,18 @@ function openPunishmentTypeForm(player, key) {
 
       queueSaveGlobalConfig();
       try { player.sendMessage(`§aPunishment Rule Updated: §f${prettyTypeKey(key)}`); } catch {}
-      openPunishmentTypeMenu(player);
-    }).catch((e) => dbgError("ui", `Punishment rule submit failed: ${e}`));
+      openNextTick(() => openPunishmentTypeMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Punishment rule submit failed: ${e}`);
+      console.warn(`[Anti-Dupe] Punishment rule submit failed: ${e}`);
+      notifyFormFailed(player, "Punishment Rule");
+      openNextTick(() => openPunishmentTypeMenu(player));
+    });
   } catch (e) {
     dbgError("ui", `Punishments form build failed: ${e}`);
-    openPunishmentsMenu(player);
+    console.warn(`[Anti-Dupe] Punishments form build failed: ${e}`);
+    notifyFormFailed(player, "Punishment Rule");
+    openNextTick(() => openPunishmentsMenu(player));
   }
 }
 
@@ -2226,7 +2390,11 @@ function openConfigurationForm(player) {
   addToggleCompat(form, "Illegal Stack Patch", !!globalConfig.illegalStackPatch);
 
   ForceOpen(player, form).then((response) => {
-    if (!response || response.canceled) return;
+    if (!response) {
+      notifyFormFailed(player, "Configuration");
+      return openNextTick(() => openSettingsMenu(player));
+    }
+    if (response.canceled) return openNextTick(() => openSettingsMenu(player));
 
     const v = response.formValues ?? [];
     globalConfig = normalizeConfig({
@@ -2244,7 +2412,12 @@ function openConfigurationForm(player) {
     dbgWarn("config", "World configuration updated via UI.");
 
     try { player.sendMessage("§aWorld Configuration Updated."); } catch {}
-    openSettingsMenu(player);
+    openNextTick(() => openSettingsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Configuration submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Configuration submit failed: ${e}`);
+    notifyFormFailed(player, "Configuration");
+    openNextTick(() => openSettingsMenu(player));
   });
 }
 
@@ -2278,15 +2451,24 @@ function openRestrictedItemsMenu(player) {
 
   ForceOpen(player, form)
     .then((res) => {
-      if (!res || res.canceled) return;
+      if (!res) {
+        notifyFormFailed(player, "Restricted Items");
+        return openNextTick(() => openSettingsMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openSettingsMenu(player));
 
-      if (res.selection === 0) openRestrictedItemsViewer(player);
-      else if (res.selection === 1) openAddRestrictedItemForm(player);
-      else if (res.selection === 2) openRemoveRestrictedItemForm(player);
-      else if (res.selection === 3) confirmResetRestrictedItems(player);
-      else openSettingsMenu(player);
+      if (res.selection === 0) openNextTick(() => openRestrictedItemsViewer(player));
+      else if (res.selection === 1) openNextTick(() => openAddRestrictedItemForm(player));
+      else if (res.selection === 2) openNextTick(() => openRemoveRestrictedItemForm(player));
+      else if (res.selection === 3) openNextTick(() => confirmResetRestrictedItems(player));
+      else openNextTick(() => openSettingsMenu(player));
     })
-    .catch((e) => dbgError("ui", `Restricted Items menu failed: ${e}`));
+    .catch((e) => {
+      dbgError("ui", `Restricted Items menu failed: ${e}`);
+      console.warn(`[Anti-Dupe] Restricted Items menu failed: ${e}`);
+      notifyFormFailed(player, "Restricted Items");
+      openNextTick(() => openSettingsMenu(player));
+    });
 }
 
 function openRestrictedItemsViewer(player) {
@@ -2304,10 +2486,19 @@ function openRestrictedItemsViewer(player) {
 
   ForceOpen(player, form)
     .then((res) => {
-      if (!res || res.canceled) return;
-      if (res.selection === 1) openRestrictedItemsMenu(player);
+      if (!res) {
+        notifyFormFailed(player, "Restricted Items Viewer");
+        return openNextTick(() => openRestrictedItemsMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openRestrictedItemsMenu(player));
+      if (res.selection === 1) openNextTick(() => openRestrictedItemsMenu(player));
     })
-    .catch((e) => dbgError("ui", `Restricted Items viewer failed: ${e}`));
+    .catch((e) => {
+      dbgError("ui", `Restricted Items viewer failed: ${e}`);
+      console.warn(`[Anti-Dupe] Restricted Items viewer failed: ${e}`);
+      notifyFormFailed(player, "Restricted Items Viewer");
+      openNextTick(() => openRestrictedItemsMenu(player));
+    });
 }
 // ModalFormData.textField compatibility wrapper.
 function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
@@ -2366,32 +2557,36 @@ function openAddRestrictedItemForm(player) {
   addTextFieldCompat(form, "Enter Item ID (namespace:item)", "minecraft:bundle", "");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Add Restricted Item");
+      return openNextTick(() => openRestrictedItemsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openRestrictedItemsMenu(player));
 
     const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
     if (!raw) {
       dbgWarn("restrict", "Add restricted item: empty input.");
       try { player.sendMessage("§cInvalid input: empty Item ID."); } catch {}
-      return openRestrictedItemsMenu(player);
+      return openNextTick(() => openRestrictedItemsMenu(player));
     }
 
     if (!isValidNamespacedId(raw)) {
       dbgWarn("restrict", `Add restricted item: invalid ID format: ${raw}`);
       try { player.sendMessage("§cInvalid Item ID. Use namespace:item (e.g., minecraft:bundle)."); } catch {}
-      return openRestrictedItemsMenu(player);
+      return openNextTick(() => openRestrictedItemsMenu(player));
     }
 
     const list = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.slice() : [];
     if (list.includes(raw)) {
       dbgInfo("restrict", `Add restricted item: already exists: ${raw}`);
       try { player.sendMessage("§eThat item is already restricted."); } catch {}
-      return openRestrictedItemsMenu(player);
+      return openNextTick(() => openRestrictedItemsMenu(player));
     }
 
     if (list.length >= MAX_RESTRICTED_ITEMS) {
       dbgWarn("restrict", `Add restricted item denied (max reached): ${MAX_RESTRICTED_ITEMS}`);
       try { player.sendMessage(`§cRestricted list full (max ${MAX_RESTRICTED_ITEMS}). Remove an item first.`); } catch {}
-      return openRestrictedItemsMenu(player);
+      return openNextTick(() => openRestrictedItemsMenu(player));
     }
 
     list.push(raw);
@@ -2407,7 +2602,12 @@ function openAddRestrictedItemForm(player) {
     dbgWarn("restrict", `Restricted item added: ${raw}`);
     try { player.sendMessage(`§aRestricted Item Added: §f${raw}`); } catch {}
 
-    openRestrictedItemsMenu(player);
+    openNextTick(() => openRestrictedItemsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Add restricted item submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Add restricted item submit failed: ${e}`);
+    notifyFormFailed(player, "Add Restricted Item");
+    openNextTick(() => openRestrictedItemsMenu(player));
   });
 }
 
@@ -2426,13 +2626,17 @@ function openRemoveRestrictedItemForm(player) {
   );
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Remove Restricted Item");
+      return openNextTick(() => openRestrictedItemsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openRestrictedItemsMenu(player));
 
     const raw = String((res.formValues ?? [])[0] ?? "").trim().toLowerCase();
     if (!raw) {
       dbgWarn("restrict", "Remove restricted item: empty input.");
       try { player.sendMessage("§cInvalid input: empty Item ID."); } catch {}
-      return openRestrictedItemsMenu(player);
+      return openNextTick(() => openRestrictedItemsMenu(player));
     }
 
     const list = Array.isArray(globalConfig.restrictedItems) ? globalConfig.restrictedItems.slice() : [];
@@ -2441,7 +2645,7 @@ function openRemoveRestrictedItemForm(player) {
     if (idx === -1) {
       dbgInfo("restrict", `Remove restricted item: not found: ${raw}`);
       try { player.sendMessage("§eThat item is not currently restricted."); } catch {}
-      return openRestrictedItemsMenu(player);
+      return openNextTick(() => openRestrictedItemsMenu(player));
     }
 
     list.splice(idx, 1);
@@ -2457,7 +2661,12 @@ function openRemoveRestrictedItemForm(player) {
     dbgWarn("restrict", `Restricted item removed: ${raw}`);
     try { player.sendMessage(`§aRestricted Item Removed: §f${raw}`); } catch {}
 
-    openRestrictedItemsMenu(player);
+    openNextTick(() => openRestrictedItemsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Remove restricted item submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Remove restricted item submit failed: ${e}`);
+    notifyFormFailed(player, "Remove Restricted Item");
+    openNextTick(() => openRestrictedItemsMenu(player));
   });
 }
 
@@ -2472,7 +2681,11 @@ function confirmResetRestrictedItems(player) {
     .button2("Reset");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Reset Restricted Items");
+      return openNextTick(() => openRestrictedItemsMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openRestrictedItemsMenu(player));
 
     if (res.selection === 1) {
       globalConfig = normalizeConfig({
@@ -2486,10 +2699,13 @@ function confirmResetRestrictedItems(player) {
       dbgWarn("restrict", "Restricted item list reset to defaults.");
       try { player.sendMessage("§aRestricted Items Reset to Defaults."); } catch {}
 
-      openRestrictedItemsMenu(player);
-    } else {
-      openRestrictedItemsMenu(player);
     }
+    openNextTick(() => openRestrictedItemsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Reset restricted items submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Reset restricted items submit failed: ${e}`);
+    notifyFormFailed(player, "Reset Restricted Items");
+    openNextTick(() => openRestrictedItemsMenu(player));
   });
 }
 
@@ -2502,7 +2718,11 @@ function openPersonalSettingsForm(player) {
   addToggleCompat(form, "Admin Alerts (Coordinates)", !player.hasTag?.(DISABLE_ALERT_TAG));
 
   ForceOpen(player, form).then((response) => {
-    if (!response || response.canceled) return;
+    if (!response) {
+      notifyFormFailed(player, "Personal Settings");
+      return openNextTick(() => openSettingsMenu(player));
+    }
+    if (response.canceled) return openNextTick(() => openSettingsMenu(player));
 
     const tags = [DISABLE_PUBLIC_MSG_TAG, DISABLE_ADMIN_MSG_TAG, DISABLE_ALERT_TAG];
 
@@ -2519,7 +2739,12 @@ function openPersonalSettingsForm(player) {
 
     dbgInfo("ui", "Personal settings updated (tags toggled).");
     try { player.sendMessage("§aPersonal Settings Updated."); } catch {}
-    openSettingsMenu(player);
+    openNextTick(() => openSettingsMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Personal settings submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Personal settings submit failed: ${e}`);
+    notifyFormFailed(player, "Personal Settings");
+    openNextTick(() => openSettingsMenu(player));
   });
 }
 
@@ -2603,12 +2828,21 @@ function openDebugMenu(player) {
     .button("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Debug Menu");
+      return openNextTick(() => openMainMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openMainMenu(player));
 
-    if (res.selection === 0) openDebugViewer(player);
-    else if (res.selection === 1) openRuntimeStatusViewer(player);
-    else if (res.selection === 2) confirmClearDebugLog(player);
-    else openMainMenu(player);
+    if (res.selection === 0) openNextTick(() => openDebugViewer(player));
+    else if (res.selection === 1) openNextTick(() => openRuntimeStatusViewer(player));
+    else if (res.selection === 2) openNextTick(() => confirmClearDebugLog(player));
+    else openNextTick(() => openMainMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Debug menu submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Debug menu submit failed: ${e}`);
+    notifyFormFailed(player, "Debug Menu");
+    openNextTick(() => openMainMenu(player));
   });
 }
 
@@ -2622,8 +2856,17 @@ function openDebugViewer(player) {
     .button2("Refresh");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 1) openDebugViewer(player);
+    if (!res) {
+      notifyFormFailed(player, "Debug Log");
+      return openNextTick(() => openDebugMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openDebugMenu(player));
+    if (res.selection === 1) openNextTick(() => openDebugViewer(player));
+  }).catch((e) => {
+    dbgError("ui", `Debug log submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Debug log submit failed: ${e}`);
+    notifyFormFailed(player, "Debug Log");
+    openNextTick(() => openDebugMenu(player));
   });
 }
 
@@ -2637,8 +2880,17 @@ function openRuntimeStatusViewer(player) {
     .button2("Back");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 1) openDebugMenu(player);
+    if (!res) {
+      notifyFormFailed(player, "Runtime Status");
+      return openNextTick(() => openDebugMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openDebugMenu(player));
+    if (res.selection === 1) openNextTick(() => openDebugMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Runtime status submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Runtime status submit failed: ${e}`);
+    notifyFormFailed(player, "Runtime Status");
+    openNextTick(() => openDebugMenu(player));
   });
 }
 
@@ -2650,7 +2902,11 @@ function confirmClearDebugLog(player) {
     .button2("Clear");
 
   ForceOpen(player, form).then((res) => {
-    if (!res || res.canceled) return;
+    if (!res) {
+      notifyFormFailed(player, "Clear Debug Log");
+      return openNextTick(() => openDebugMenu(player));
+    }
+    if (res.canceled) return openNextTick(() => openDebugMenu(player));
 
     if (res.selection === 1) {
       debugLog = [];
@@ -2659,7 +2915,12 @@ function confirmClearDebugLog(player) {
       dbgWarn("debug", "Debug log cleared by admin.");
       try { player.sendMessage("§aDebug Log Cleared."); } catch {}
     }
-    openDebugMenu(player);
+    openNextTick(() => openDebugMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Clear debug log submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Clear debug log submit failed: ${e}`);
+    notifyFormFailed(player, "Clear Debug Log");
+    openNextTick(() => openDebugMenu(player));
   });
 }
 
@@ -2675,11 +2936,19 @@ function openMainMenu(player) {
     .button("Debug");
 
   ForceOpen(player, menu).then((res) => {
-    if (!res || res.canceled) return;
-    if (res.selection === 0) openSettingsMenu(player);
-    else if (res.selection === 1) openLogsMenu(player);
-    else if (res.selection === 2) openPunishmentsMenu(player);
-    else openDebugMenu(player);
+    if (!res) {
+      notifyFormFailed(player, "Main Menu");
+      return;
+    }
+    if (res.canceled) return;
+    if (res.selection === 0) openNextTick(() => openSettingsMenu(player));
+    else if (res.selection === 1) openNextTick(() => openLogsMenu(player));
+    else if (res.selection === 2) openNextTick(() => openPunishmentsMenu(player));
+    else openNextTick(() => openDebugMenu(player));
+  }).catch((e) => {
+    dbgError("ui", `Main menu submit failed: ${e}`);
+    console.warn(`[Anti-Dupe] Main menu submit failed: ${e}`);
+    notifyFormFailed(player, "Main Menu");
   });
 }
 
