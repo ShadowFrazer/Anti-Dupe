@@ -111,6 +111,7 @@ const PISTON_OFFSETS = [
 
 // --- Debug (Runtime Only) ---
 const DEBUG_LOG_MAX = 250;
+const DEBUG_CONSOLE = false;
 
 let debugLog = []; // runtime only
 let debugCounters = { info: 0, warn: 0, error: 0 };
@@ -141,6 +142,9 @@ function dbgPush(level, area, message) {
 function dbgInfo(area, msg) { dbgPush("info", area, msg); }
 function dbgWarn(area, msg) { dbgPush("warn", area, msg); }
 function dbgError(area, msg) { dbgPush("error", area, msg); }
+
+function logConsoleWarn(msg) { if (DEBUG_CONSOLE) console.warn(msg); }
+function logConsoleError(msg) { console.error(msg); }
 
 function dbgOncePer(key, minTicks, level, area, msg) {
   try {
@@ -2194,39 +2198,35 @@ function openPunishmentGlobalOptionsForm(player) {
     const punish = globalConfig.punishments;
     const form = new ModalFormData().title("Punishment Configuration");
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Enable Punishments toggle");
+      dbgInfo("ui", "adding field: Enable Punishments toggle");
       addToggleCompat(form, "Enable Punishments", !!punish.enabled);
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Enable Punishments toggle", e);
       dbgWarn("ui", `Punishment Configuration field failed: Enable Punishments toggle: ${e}`);
       throw e;
     }
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Allow Kick Actions toggle");
+      dbgInfo("ui", "adding field: Allow Kick Actions toggle");
       addToggleCompat(form, "Allow Kick Actions", !!punish.allowKick);
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Allow Kick Actions toggle", e);
       dbgWarn("ui", `Punishment Configuration field failed: Allow Kick Actions toggle: ${e}`);
       throw e;
     }
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Bypass Tag text field");
+      dbgInfo("ui", "adding field: Bypass Tag text field");
       addTextFieldCompat(form, "Bypass Tag (Optional)", "antidupe:bypass", punish.bypassTag ?? "");
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Bypass Tag text field", e);
       dbgWarn("ui", `Punishment Configuration field failed: Bypass Tag text field: ${e}`);
       throw e;
     }
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Global Punishment Tag text field");
+      dbgInfo("ui", "adding field: Global Punishment Tag text field");
       addTextFieldCompat(form, "Global Punishment Tag (Optional)", "antidupe:punishment", punish.punishmentTag ?? "");
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Global Punishment Tag text field", e);
       dbgWarn("ui", `Punishment Configuration field failed: Global Punishment Tag text field: ${e}`);
       throw e;
     }
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Kick Cooldown slider");
+      dbgInfo("ui", "adding field: Kick Cooldown slider");
       addSliderCompat(
         form,
         "Kick Cooldown (Ticks)",
@@ -2236,12 +2236,11 @@ function openPunishmentGlobalOptionsForm(player) {
         clampRangeInt(punish.cooldownTicks, 0, 200, 40)
       );
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Kick Cooldown slider", e);
       dbgWarn("ui", `Punishment Configuration field failed: Kick Cooldown slider: ${e}`);
       throw e;
     }
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Kick Reason Template text field");
+      dbgInfo("ui", "adding field: Kick Reason Template text field");
       addTextFieldCompat(
         form,
         "Kick Reason Template",
@@ -2249,15 +2248,13 @@ function openPunishmentGlobalOptionsForm(player) {
         punish.reasonTemplate ?? ""
       );
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Kick Reason Template text field", e);
       dbgWarn("ui", `Punishment Configuration field failed: Kick Reason Template text field: ${e}`);
       throw e;
     }
     try {
-      console.warn("[Anti-Dupe][UI] adding field: Public Kick Message toggle");
+      dbgInfo("ui", "adding field: Public Kick Message toggle");
       addToggleCompat(form, "Public Kick Message", !!punish.publicKickMessage);
     } catch (e) {
-      console.warn("[Anti-Dupe][UI] FAILED field: Public Kick Message toggle", e);
       dbgWarn("ui", `Punishment Configuration field failed: Public Kick Message toggle: ${e}`);
       throw e;
     }
@@ -2293,13 +2290,13 @@ function openPunishmentGlobalOptionsForm(player) {
       openNextTick(() => openPunishmentsMenu(player));
     }).catch((e) => {
       dbgError("ui", `Punishment configuration submit failed: ${e}`);
-      console.warn(`[Anti-Dupe] Punishment configuration submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Punishment configuration submit failed: ${e}`);
       notifyFormFailed(player, "Punishment Configuration");
       openNextTick(() => openPunishmentsMenu(player));
     });
   } catch (e) {
     dbgError("ui", `Punishments form build failed: ${e}`);
-    console.warn(`[Anti-Dupe] Punishments form build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Punishments form build failed: ${e}`);
     try { player.sendMessage("§c[Anti-Dupe] Punishment Configuration UI failed to build. Check console warnings."); } catch {}
     notifyFormFailed(player, "Punishment Configuration");
     openNextTick(() => openPunishmentsMenu(player));
@@ -2309,12 +2306,10 @@ function openPunishmentGlobalOptionsForm(player) {
 function formatPunishmentTypeSummary(key) {
   const types = globalConfig.punishments?.types ?? {};
   const t = types[key] ?? {};
-  const enabled = t.enabled ? "Enabled" : "Disabled";
-  const threshold = Number.isFinite(t.threshold) && t.threshold > 0 ? t.threshold : "Disabled";
+  const enabled = t.enabled ? "ON" : "OFF";
+  const threshold = Number.isFinite(t.threshold) && t.threshold > 0 ? String(t.threshold) : "Disabled";
   const tag = t.tag ? t.tag : "None";
-  const kickAt = t.kickAtThreshold ? "On" : "Off";
-  const kickRepeat = t.kickIfTaggedOnRepeat ? "On" : "Off";
-  return `${prettyTypeKey(key)} — ${enabled} | Threshold: ${threshold} | Tag: ${tag} | Kick At Threshold: ${kickAt} | Kick If Tagged: ${kickRepeat}`;
+  return `${prettyTypeKey(key)} | ${enabled} | Th: ${threshold} | Tag: ${tag}`;
 }
 
 function openPunishmentTypeMenu(player) {
@@ -2322,24 +2317,16 @@ function openPunishmentTypeMenu(player) {
     if (!configLoaded) loadGlobalConfig();
     dbgInfo("ui", "Opened Punishment Type Menu.");
 
-    const lines = [
-      formatPunishmentTypeSummary("ghost"),
-      formatPunishmentTypeSummary("plant"),
-      formatPunishmentTypeSummary("hopper"),
-      formatPunishmentTypeSummary("dropper"),
-      formatPunishmentTypeSummary("illegal"),
-      formatPunishmentTypeSummary("other"),
-    ];
-
     const form = new ActionFormData()
       .title("Dupe Type Rules")
-      .body(lines.join("\n"))
-      .button("Ghost Stack")
-      .button("Piston")
-      .button("Hopper")
-      .button("Dropper")
-      .button("Illegal Stack")
-      .button("Other")
+      .body("Select a dupe type to edit.\nLegend: ON/OFF | Th=threshold | Tag=tag")
+      .button("Edit Global Options")
+      .button(formatPunishmentTypeSummary("ghost"))
+      .button(formatPunishmentTypeSummary("plant"))
+      .button(formatPunishmentTypeSummary("hopper"))
+      .button(formatPunishmentTypeSummary("dropper"))
+      .button(formatPunishmentTypeSummary("illegal"))
+      .button(formatPunishmentTypeSummary("other"))
       .button("Back");
 
     ForceOpen(player, form).then((res) => {
@@ -2348,22 +2335,23 @@ function openPunishmentTypeMenu(player) {
         return openNextTick(() => openPunishmentsMenu(player));
       }
       if (res.canceled) return openNextTick(() => openPunishmentsMenu(player));
-      if (res.selection === 0) openNextTick(() => openPunishmentTypeForm(player, "ghost"));
-      else if (res.selection === 1) openNextTick(() => openPunishmentTypeForm(player, "plant"));
-      else if (res.selection === 2) openNextTick(() => openPunishmentTypeForm(player, "hopper"));
-      else if (res.selection === 3) openNextTick(() => openPunishmentTypeForm(player, "dropper"));
-      else if (res.selection === 4) openNextTick(() => openPunishmentTypeForm(player, "illegal"));
-      else if (res.selection === 5) openNextTick(() => openPunishmentTypeForm(player, "other"));
+      if (res.selection === 0) openNextTick(() => openPunishmentGlobalOptionsForm(player));
+      else if (res.selection === 1) openNextTick(() => openPunishmentTypeForm(player, "ghost"));
+      else if (res.selection === 2) openNextTick(() => openPunishmentTypeForm(player, "plant"));
+      else if (res.selection === 3) openNextTick(() => openPunishmentTypeForm(player, "hopper"));
+      else if (res.selection === 4) openNextTick(() => openPunishmentTypeForm(player, "dropper"));
+      else if (res.selection === 5) openNextTick(() => openPunishmentTypeForm(player, "illegal"));
+      else if (res.selection === 6) openNextTick(() => openPunishmentTypeForm(player, "other"));
       else openNextTick(() => openPunishmentsMenu(player));
     }).catch((e) => {
       dbgError("ui", `Punishment type menu submit failed: ${e}`);
-      console.warn(`[Anti-Dupe] Punishment type menu submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Punishment type menu submit failed: ${e}`);
       notifyFormFailed(player, "Punishment Type Menu");
       openNextTick(() => openPunishmentsMenu(player));
     });
   } catch (e) {
     dbgError("ui", `Punishment type menu build failed: ${e}`);
-    console.warn(`[Anti-Dupe] Punishment type menu build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Punishment type menu build failed: ${e}`);
     notifyFormFailed(player, "Punishment Type Menu");
     openNextTick(() => openPunishmentsMenu(player));
   }
@@ -2422,13 +2410,13 @@ function openPunishmentTypeForm(player, key) {
       openNextTick(() => openPunishmentTypeMenu(player));
     }).catch((e) => {
       dbgError("ui", `Punishment rule submit failed: ${e}`);
-      console.warn(`[Anti-Dupe] Punishment rule submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Punishment rule submit failed: ${e}`);
       notifyFormFailed(player, "Punishment Rule");
       openNextTick(() => openPunishmentTypeMenu(player));
     });
   } catch (e) {
     dbgError("ui", `Punishments form build failed: ${e}`);
-    console.warn(`[Anti-Dupe] Punishments form build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Punishments form build failed: ${e}`);
     notifyFormFailed(player, "Punishment Rule");
     openNextTick(() => openPunishmentsMenu(player));
   }
@@ -2612,8 +2600,7 @@ function addSliderCompat(form, label, min, max, step, defaultValue) {
     form.slider(label, min, max, step, defaultValue);
     if (!sliderCompatLogged) {
       const msg = "Slider overload active: slider(label, min, max, step, defaultValue)";
-      console.warn(`[Anti-Dupe][UI] ${msg}`);
-      dbgWarn("ui", msg);
+      dbgInfo("ui", msg);
       sliderCompatLogged = true;
     }
     return form;
@@ -2623,8 +2610,7 @@ function addSliderCompat(form, label, min, max, step, defaultValue) {
         form.slider(label, min, max, defaultValue);
         if (!sliderCompatLogged) {
           const msg = "Slider overload active: slider(label, min, max, defaultValue)";
-          console.warn(`[Anti-Dupe][UI] ${msg}`);
-          dbgWarn("ui", msg);
+          dbgInfo("ui", msg);
           sliderCompatLogged = true;
         }
         return form;
@@ -2633,8 +2619,7 @@ function addSliderCompat(form, label, min, max, step, defaultValue) {
           form.slider(label, min, max);
           if (!sliderCompatLogged) {
             const msg = "Slider overload active: slider(label, min, max)";
-            console.warn(`[Anti-Dupe][UI] ${msg}`);
-            dbgWarn("ui", msg);
+            dbgInfo("ui", msg);
             sliderCompatLogged = true;
           }
           return form;
