@@ -3227,6 +3227,73 @@ function addSliderCompat(form, label, min, max, step, defaultValue) {
   }
 }
 
+// ModalFormData.toggle compatibility wrapper.
+function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
+  const defaultBool = !!defaultValue;
+  // Legacy overload: defaultValue boolean.
+  try {
+    form.toggle(label, defaultBool);
+    return form;
+  } catch (e1) {
+    try {
+      const opts = { defaultValue: defaultBool };
+      const tip = String(tooltip ?? "").trim();
+      if (tip) opts.tooltip = tip;
+      form.toggle(label, opts);
+      return form;
+    } catch (e2) {
+      try {
+        form.toggle(label);
+        return form;
+      } catch (e3) {
+        dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
+        return form;
+      }
+    }
+  }
+}
+
+// ModalFormData.slider compatibility wrapper.
+let sliderCompatLogged = false;
+function addSliderCompat(form, label, min, max, step, defaultValue) {
+  try {
+    form.slider(label, min, max, step, defaultValue);
+    if (!sliderCompatLogged) {
+      const msg = "Slider overload active: slider(label, min, max, step, defaultValue)";
+      dbgInfo("ui", msg);
+      sliderCompatLogged = true;
+    }
+    return form;
+  } catch (e1) {
+    if (String(e1).includes("Incorrect number of arguments")) {
+      try {
+        form.slider(label, min, max, defaultValue);
+        if (!sliderCompatLogged) {
+          const msg = "Slider overload active: slider(label, min, max, defaultValue)";
+          dbgInfo("ui", msg);
+          sliderCompatLogged = true;
+        }
+        return form;
+      } catch (e2) {
+        try {
+          form.slider(label, min, max);
+          if (!sliderCompatLogged) {
+            const msg = "Slider overload active: slider(label, min, max)";
+            dbgInfo("ui", msg);
+            sliderCompatLogged = true;
+          }
+          return form;
+        } catch (e3) {
+          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
+          return form;
+        }
+      }
+    }
+    dbgError("ui", `slider attach failed: ${e1}`);
+    return form;
+  }
+}
+
 
 
 function openAddRestrictedItemForm(player) {
@@ -3603,6 +3670,293 @@ function confirmClearDebugLog(player) {
   });
 }
 
+// --- Help Menu ---
+function openHelpMenu(player) {
+  try {
+    dbgInfo("ui", "Opened Help Menu.");
+    const form = new ActionFormData()
+      .title("Help")
+      .body("Anti-Dupe help and tips.\nUse the buttons below to learn features.")
+      .button("Quick Start")
+      .button("Patches & Scanning")
+      .button("Punishments & Kick Logic")
+      .button("Violation Resets")
+      .button("Restricted Items")
+      .button("Debug & Runtime Status")
+      .button("Back");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Menu");
+        return openNextTick(() => openMainMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openMainMenu(player));
+      if (res.selection === 0) openNextTick(() => openHelpQuickStart(player));
+      else if (res.selection === 1) openNextTick(() => openHelpPatches(player));
+      else if (res.selection === 2) openNextTick(() => openHelpPunishments(player));
+      else if (res.selection === 3) openNextTick(() => openHelpViolationResets(player));
+      else if (res.selection === 4) openNextTick(() => openHelpRestrictedItems(player));
+      else if (res.selection === 5) openNextTick(() => openHelpDebug(player));
+      else openNextTick(() => openMainMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help menu submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help menu submit failed: ${e}`);
+      notifyFormFailed(player, "Help Menu");
+      openNextTick(() => openMainMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help menu build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help menu build failed: ${e}`);
+    notifyFormFailed(player, "Help Menu");
+    openNextTick(() => openMainMenu(player));
+  }
+}
+
+function openHelpQuickStart(player) {
+  try {
+    dbgInfo("ui", "Opened Help Quick Start.");
+    const body = [
+      "Admins need tag: Admin",
+      "Open menu: hold/use minecraft:bedrock",
+      "",
+      "Settings: patches and restricted items.",
+      "Logs: Incident Logs and Violations Dashboard.",
+      "Punishments: rules, tags, and kick settings.",
+      "Debug: runtime-only logs and status.",
+    ].join("\n");
+
+    const form = new MessageFormData()
+      .title("Help: Quick Start")
+      .body(body)
+      .button1("Back")
+      .button2("Help Menu");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Quick Start");
+        return openNextTick(() => openHelpMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openHelpMenu(player));
+      if (res.selection === 1) openNextTick(() => openHelpMenu(player));
+      else openNextTick(() => openHelpMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help Quick Start submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help Quick Start submit failed: ${e}`);
+      notifyFormFailed(player, "Help Quick Start");
+      openNextTick(() => openHelpMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help Quick Start build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help Quick Start build failed: ${e}`);
+    notifyFormFailed(player, "Help Quick Start");
+    openNextTick(() => openHelpMenu(player));
+  }
+}
+
+function openHelpPatches(player) {
+  try {
+    dbgInfo("ui", "Opened Help Patches & Scanning.");
+    const body = [
+      "Ghost Stack Patch: clears cursor ghost stacks by dropping 1 item.",
+      "Piston/Hopper/Dropper scanning: radius-based checks with enforcement.",
+      "- Piston: removes illegal piston placements in range.",
+      "- Hopper: wipes restricted items from hoppers.",
+      "- Dropper: ejects then clears restricted items.",
+      "Illegal Stack Enforcement: removes stacks with invalid amounts on interval.",
+    ].join("\n");
+
+    const form = new MessageFormData()
+      .title("Help: Patches & Scanning")
+      .body(body)
+      .button1("Back")
+      .button2("Help Menu");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Patches");
+        return openNextTick(() => openHelpMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openHelpMenu(player));
+      if (res.selection === 1) openNextTick(() => openHelpMenu(player));
+      else openNextTick(() => openHelpMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help Patches submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help Patches submit failed: ${e}`);
+      notifyFormFailed(player, "Help Patches");
+      openNextTick(() => openHelpMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help Patches build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help Patches build failed: ${e}`);
+    notifyFormFailed(player, "Help Patches");
+    openNextTick(() => openHelpMenu(player));
+  }
+}
+
+function openHelpPunishments(player) {
+  try {
+    dbgInfo("ui", "Opened Help Punishments.");
+    const body = [
+      "Enable Punishments = master on/off.",
+      "Allow Kick Actions = global kick permission.",
+      "",
+      "Per type: Enabled, Threshold, Kick At Threshold, Kick If Tagged On Repeat.",
+      "Bypass Tag: skip punishments if player has bypassTag.",
+      "Punishment tags: per-type tag overrides global punishmentTag.",
+      "Effective tag = type tag or global tag.",
+      "",
+      "Tokens: {TYPE}, {COUNT}, {THRESHOLD}",
+      "Example: Anti-Dupe: {TYPE} ({COUNT}/{THRESHOLD})",
+      "Cooldown ticks limit repeated kicks.",
+      "Public Kick Message broadcasts kick notice.",
+      "",
+      "Kick requires Allow Kick Actions ON, Kick At Threshold ON, and Threshold > 0.",
+    ].join("\n");
+
+    const form = new MessageFormData()
+      .title("Help: Punishments & Kick Logic")
+      .body(body)
+      .button1("Back")
+      .button2("Help Menu");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Punishments");
+        return openNextTick(() => openHelpMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openHelpMenu(player));
+      if (res.selection === 1) openNextTick(() => openHelpMenu(player));
+      else openNextTick(() => openHelpMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help Punishments submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help Punishments submit failed: ${e}`);
+      notifyFormFailed(player, "Help Punishments");
+      openNextTick(() => openHelpMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help Punishments build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help Punishments build failed: ${e}`);
+    notifyFormFailed(player, "Help Punishments");
+    openNextTick(() => openHelpMenu(player));
+  }
+}
+
+function openHelpViolationResets(player) {
+  try {
+    dbgInfo("ui", "Opened Help Violation Resets.");
+    const body = [
+      "Location: Punishments → Violation Resets.",
+      "Resets use the player NAME (scoreboard key), online or offline.",
+      "Reset All Types clears all per-type scores.",
+      "Reset Total Score also clears ad_total.",
+      "Type menu includes Total Only option.",
+      "This affects scoreboard objectives (ad_*).",
+    ].join("\n");
+
+    const form = new MessageFormData()
+      .title("Help: Violation Resets")
+      .body(body)
+      .button1("Back")
+      .button2("Help Menu");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Violation Resets");
+        return openNextTick(() => openHelpMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openHelpMenu(player));
+      if (res.selection === 1) openNextTick(() => openHelpMenu(player));
+      else openNextTick(() => openHelpMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help Violation Resets submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help Violation Resets submit failed: ${e}`);
+      notifyFormFailed(player, "Help Violation Resets");
+      openNextTick(() => openHelpMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help Violation Resets build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help Violation Resets build failed: ${e}`);
+    notifyFormFailed(player, "Help Violation Resets");
+    openNextTick(() => openHelpMenu(player));
+  }
+}
+
+function openHelpRestrictedItems(player) {
+  try {
+    dbgInfo("ui", "Opened Help Restricted Items.");
+    const body = [
+      "World list controls hopper/dropper wipe/eject behavior.",
+      "Add/remove items as namespace:item (e.g., minecraft:bundle).",
+      `MAX_RESTRICTED_ITEMS = ${MAX_RESTRICTED_ITEMS}.`,
+      "Reset to defaults restores bundle list.",
+      "Restricted item set is rebuilt after edits.",
+    ].join("\n");
+
+    const form = new MessageFormData()
+      .title("Help: Restricted Items")
+      .body(body)
+      .button1("Back")
+      .button2("Help Menu");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Restricted Items");
+        return openNextTick(() => openHelpMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openHelpMenu(player));
+      if (res.selection === 1) openNextTick(() => openHelpMenu(player));
+      else openNextTick(() => openHelpMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help Restricted Items submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help Restricted Items submit failed: ${e}`);
+      notifyFormFailed(player, "Help Restricted Items");
+      openNextTick(() => openHelpMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help Restricted Items build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help Restricted Items build failed: ${e}`);
+    notifyFormFailed(player, "Help Restricted Items");
+    openNextTick(() => openHelpMenu(player));
+  }
+}
+
+function openHelpDebug(player) {
+  try {
+    dbgInfo("ui", "Opened Help Debug & Runtime Status.");
+    const body = [
+      "Debug log is runtime-only (not persistent).",
+      "Runtime Status shows loaded states, patch toggles, and counters.",
+      "If a form fails to open, check Debug → View Debug Log.",
+    ].join("\n");
+
+    const form = new MessageFormData()
+      .title("Help: Debug & Runtime Status")
+      .body(body)
+      .button1("Back")
+      .button2("Help Menu");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Help Debug");
+        return openNextTick(() => openHelpMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openHelpMenu(player));
+      if (res.selection === 1) openNextTick(() => openHelpMenu(player));
+      else openNextTick(() => openHelpMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Help Debug submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Help Debug submit failed: ${e}`);
+      notifyFormFailed(player, "Help Debug");
+      openNextTick(() => openHelpMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Help Debug build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Help Debug build failed: ${e}`);
+    notifyFormFailed(player, "Help Debug");
+    openNextTick(() => openHelpMenu(player));
+  }
+}
+
 // --- Main Menu ---
 function openMainMenu(player) {
   dbgInfo("ui", "Opened Main Menu.");
@@ -3612,7 +3966,8 @@ function openMainMenu(player) {
     .button("Settings")
     .button("Logs")
     .button("Punishments")
-    .button("Debug");
+    .button("Debug")
+    .button("Help");
 
   ForceOpen(player, menu).then((res) => {
     if (!res) {
@@ -3623,7 +3978,8 @@ function openMainMenu(player) {
     if (res.selection === 0) openNextTick(() => openSettingsMenu(player));
     else if (res.selection === 1) openNextTick(() => openLogsMenu(player));
     else if (res.selection === 2) openNextTick(() => openPunishmentsMenu(player));
-    else openNextTick(() => openDebugMenu(player));
+    else if (res.selection === 3) openNextTick(() => openDebugMenu(player));
+    else openNextTick(() => openHelpMenu(player));
   }).catch((e) => {
     dbgError("ui", `Main menu submit failed: ${e}`);
     console.warn(`[Anti-Dupe] Main menu submit failed: ${e}`);
