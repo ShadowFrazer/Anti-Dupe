@@ -58,7 +58,7 @@ const DEFAULT_GLOBAL_CONFIG = {
     bypassTag: "",
     punishmentTag: "",
     reasonTemplate: "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
-    cooldownTicks: 40,
+    cooldownTicks: 20,
     publicKickMessage: false,
     types: {
       ghost:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
@@ -1042,14 +1042,17 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
     if (!punish?.enabled) return "";
 
     const bypassTag = String(punish.bypassTag ?? "").trim();
-    if (bypassTag && player.hasTag?.(bypassTag)) return "";
+    if (bypassTag && player.hasTag?.(bypassTag)) {
+      dbgInfo("punish", `Punishment gated for ${name}: bypass tag present (${bypassTag}).`);
+      return "";
+    }
 
     const key = dupeTypeKey(incidentType);
     const typeSettings = punish.types?.[key] ?? punish.types?.other;
     if (!typeSettings?.enabled) return "";
 
     const threshold = clampRangeInt(typeSettings.threshold, 0, 200, 0);
-    if (threshold <= 0) return "";
+    const thresholdEnabled = threshold > 0;
 
     const typeLabel = prettyTypeKey(key);
     const typeScore = Number.isFinite(vio?.typeScore) ? vio.typeScore : 0;
@@ -1059,13 +1062,19 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
     const globalTag = String(punish.punishmentTag ?? "").trim();
     const effectiveTag = typeTag || globalTag;
 
-    if (typeTag) {
-      if (typeSettings.kickIfTaggedOnRepeat && player.hasTag?.(typeTag)) {
-        if (punish.allowKick) {
+    if (typeSettings.kickIfTaggedOnRepeat) {
+      if (!effectiveTag) {
+        dbgInfo("punish", `Repeat kick gated for ${name}: no punishment tag configured.`);
+      } else if (player.hasTag?.(effectiveTag)) {
+        if (!punish.allowKick) {
+          dbgInfo("punish", `Repeat kick gated for ${name}: global kicks disabled.`);
+        } else {
           const now = system.currentTick;
           const last = lastPunishTickByPlayerName.get(name) ?? -999999;
-          const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
-          if (now - last >= cooldown) {
+          const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 20);
+          if (now - last < cooldown) {
+            dbgInfo("punish", `Repeat kick gated for ${name}: cooldown active (${cooldown} ticks).`);
+          } else {
             const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
             const kicked = await tryKickPlayer(player, reason);
             lastPunishTickByPlayerName.set(name, now);
@@ -1088,38 +1097,48 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
         }
         return mitigationNote;
       }
+    }
 
+    if (typeTag) {
       if (!player.hasTag?.(typeTag)) {
         player.addTag?.(typeTag);
         mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${typeTag})`);
       }
     }
 
-    if (effectiveTag && typeScore >= threshold && !player.hasTag?.(effectiveTag)) {
+    if (effectiveTag && thresholdEnabled && typeScore >= threshold && !player.hasTag?.(effectiveTag)) {
       player.addTag?.(effectiveTag);
       mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${effectiveTag})`);
     }
 
-    if (typeSettings.kickAtThreshold && punish.allowKick && typeScore >= threshold) {
-      const now = system.currentTick;
-      const last = lastPunishTickByPlayerName.get(name) ?? -999999;
-      const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
-      if (now - last >= cooldown) {
-        const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
-        const kicked = await tryKickPlayer(player, reason);
-        lastPunishTickByPlayerName.set(name, now);
-        if (kicked) {
-          mitigationNote = appendMitigation(mitigationNote, `Punishment: Kicked at Threshold (${typeScore}/${threshold})`);
-          const dimId = safeDimIdFromEntity(player);
-          const dimLabel = prettyDimension(dimId);
-          const pos = player.location ?? loc;
-          const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
-          const tagNote = effectiveTag ? ` Tag: ${effectiveTag}.` : "";
-          sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for §f${typeLabel}§r §7violations (${typeScore}/${threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r${tagNote}`);
-          if (punish.publicKickMessage) {
-            for (const p of getPlayersSafe()) {
-              if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
-                try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+    if (thresholdEnabled && typeScore >= threshold) {
+      if (!punish.allowKick) {
+        dbgInfo("punish", `Kick gated for ${name}: global kicks disabled.`);
+      } else if (!typeSettings.kickAtThreshold) {
+        dbgInfo("punish", `Kick gated for ${name}: kick at threshold disabled for ${typeLabel}.`);
+      } else {
+        const now = system.currentTick;
+        const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+        const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 20);
+        if (now - last < cooldown) {
+          dbgInfo("punish", `Kick gated for ${name}: cooldown active (${cooldown} ticks).`);
+        } else {
+          const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
+          const kicked = await tryKickPlayer(player, reason);
+          lastPunishTickByPlayerName.set(name, now);
+          if (kicked) {
+            mitigationNote = appendMitigation(mitigationNote, `Punishment: Kicked at Threshold (${typeScore}/${threshold})`);
+            const dimId = safeDimIdFromEntity(player);
+            const dimLabel = prettyDimension(dimId);
+            const pos = player.location ?? loc;
+            const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
+            const tagNote = effectiveTag ? ` Tag: ${effectiveTag}.` : "";
+            sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for §f${typeLabel}§r §7violations (${typeScore}/${threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r${tagNote}`);
+            if (punish.publicKickMessage) {
+              for (const p of getPlayersSafe()) {
+                if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+                  try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+                }
               }
             }
           }
@@ -2198,9 +2217,9 @@ function openPunishmentGlobalOptionsHub(player) {
 
     const punish = globalConfig.punishments ?? {};
     const status = punish.enabled ? "Enabled" : "Disabled";
-    const kickStatus = punish.allowKick ? "Allowed" : "Off";
+    const kickStatus = punish.allowKick ? "Allowed" : "Disabled";
     const bypass = punish.bypassTag ? punish.bypassTag : "None";
-    const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 40);
+    const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 20);
     const publicKick = punish.publicKickMessage ? "On" : "Off";
 
     const form = new ActionFormData()
@@ -2208,9 +2227,8 @@ function openPunishmentGlobalOptionsHub(player) {
       .body(
         [
           `Status: ${status}`,
-          `Kick Actions: ${kickStatus}`,
+          `Kick Actions: ${kickStatus} (Cooldown: ${cooldown} ticks)`,
           `Bypass Tag: ${bypass}`,
-          `Kick Cooldown: ${cooldown} ticks`,
           `Public Kick Message: ${publicKick}`,
         ].join("\n")
       )
@@ -2317,10 +2335,24 @@ function openPunishmentGlobalOptionsForm(player) {
       throw e;
     }
     try {
+      dbgInfo("ui", "adding field: Clear Bypass Tag toggle");
+      addToggleCompat(form, "Clear Bypass Tag", false);
+    } catch (e) {
+      dbgWarn("ui", `Punishment Configuration field failed: Clear Bypass Tag toggle: ${e}`);
+      throw e;
+    }
+    try {
       dbgInfo("ui", "adding field: Global Punishment Tag text field");
       addTextFieldCompat(form, "Global Punishment Tag (Optional)", "antidupe:punishment", punish.punishmentTag ?? "");
     } catch (e) {
       dbgWarn("ui", `Punishment Configuration field failed: Global Punishment Tag text field: ${e}`);
+      throw e;
+    }
+    try {
+      dbgInfo("ui", "adding field: Clear Punishment Tag toggle");
+      addToggleCompat(form, "Clear Punishment Tag", false);
+    } catch (e) {
+      dbgWarn("ui", `Punishment Configuration field failed: Clear Punishment Tag toggle: ${e}`);
       throw e;
     }
     try {
@@ -2331,7 +2363,7 @@ function openPunishmentGlobalOptionsForm(player) {
         0,
         200,
         5,
-        clampRangeInt(punish.cooldownTicks, 0, 200, 40)
+        clampRangeInt(punish.cooldownTicks, 0, 200, 20)
       );
     } catch (e) {
       dbgWarn("ui", `Punishment Configuration field failed: Kick Cooldown slider: ${e}`);
@@ -2350,6 +2382,13 @@ function openPunishmentGlobalOptionsForm(player) {
       throw e;
     }
     try {
+      dbgInfo("ui", "adding field: Clear Reason Template toggle");
+      addToggleCompat(form, "Clear Reason Template", false);
+    } catch (e) {
+      dbgWarn("ui", `Punishment Configuration field failed: Clear Reason Template toggle: ${e}`);
+      throw e;
+    }
+    try {
       dbgInfo("ui", "adding field: Public Kick Message toggle");
       addToggleCompat(form, "Public Kick Message", !!punish.publicKickMessage);
     } catch (e) {
@@ -2364,9 +2403,21 @@ function openPunishmentGlobalOptionsForm(player) {
       }
       if (response.canceled) return openNextTick(() => openPunishmentGlobalOptionsHub(player));
       const v = response.formValues ?? [];
-      const bypassTag = String(v[2] ?? "").trim().slice(0, 32);
-      const punishmentTag = String(v[3] ?? "").trim().slice(0, 32);
-      const reasonTemplate = String(v[5] ?? "").trim().slice(0, 120);
+      const bypassInput = String(v[2] ?? "").trim().slice(0, 32);
+      const clearBypass = !!v[3];
+      const punishmentInput = String(v[4] ?? "").trim().slice(0, 32);
+      const clearPunishment = !!v[5];
+      const reasonInput = String(v[7] ?? "").trim().slice(0, 120);
+      const clearReason = !!v[8];
+      const bypassTag = clearBypass
+        ? ""
+        : (bypassInput ? bypassInput : globalConfig.punishments.bypassTag);
+      const punishmentTag = clearPunishment
+        ? ""
+        : (punishmentInput ? punishmentInput : globalConfig.punishments.punishmentTag);
+      const reasonTemplate = clearReason
+        ? ""
+        : (reasonInput ? reasonInput : globalConfig.punishments.reasonTemplate);
 
       globalConfig = normalizeConfig({
         ...globalConfig,
@@ -2376,9 +2427,9 @@ function openPunishmentGlobalOptionsForm(player) {
           allowKick: !!v[1],
           bypassTag,
           punishmentTag,
-          cooldownTicks: clampRangeInt(v[4], 0, 200, globalConfig.punishments.cooldownTicks),
+          cooldownTicks: clampRangeInt(v[6], 0, 200, globalConfig.punishments.cooldownTicks),
           reasonTemplate,
-          publicKickMessage: !!v[6],
+          publicKickMessage: !!v[9],
           types: globalConfig.punishments.types,
         },
       });
@@ -2408,15 +2459,21 @@ function formatDupeTypeRulesBlock(key) {
   const enabled = t.enabled ? "Enabled" : "Disabled";
   const threshold = Number.isFinite(t.threshold) && t.threshold > 0 ? String(t.threshold) : "Disabled";
   const tag = t.tag ? t.tag : "None";
-  const kickThreshold = t.kickAtThreshold && punish.allowKick && Number.isFinite(t.threshold) && t.threshold > 0
-    ? String(t.threshold)
+  const thresholdValue = Number.isFinite(t.threshold) ? t.threshold : 0;
+  const kickThreshold = t.kickAtThreshold && punish.allowKick && thresholdValue > 0
+    ? String(thresholdValue)
     : "Off";
   const kickIfTagged = t.kickIfTaggedOnRepeat ? "On" : "Off";
+  let kickAction = "Off";
+  if (!punish.allowKick) kickAction = "Off (Global Kick Disabled)";
+  else if (!t.kickAtThreshold) kickAction = "Off (Kick At Threshold Off)";
+  else if (!Number.isFinite(thresholdValue) || thresholdValue <= 0) kickAction = "Off (Threshold Disabled)";
+  else kickAction = "On (At Threshold)";
 
   return [
     `${prettyTypeKey(key)}: ${enabled}`,
     `Threshold: ${threshold} | Kick Threshold: ${kickThreshold}`,
-    `Tag: ${tag} | Kick If Tagged: ${kickIfTagged}`,
+    `Tag: ${tag} | Kick If Tagged: ${kickIfTagged} | Kick Action: ${kickAction}`,
   ].join("\n");
 }
 
@@ -2487,6 +2544,7 @@ function openPunishmentTypeForm(player, key) {
     addToggleCompat(form, "Enabled", !!typeSettings.enabled);
     addTextFieldCompat(form, "Threshold (0 = Disabled)", "0-200", String(typeSettings.threshold ?? ""));
     addTextFieldCompat(form, "Violator Tag (Optional)", "antidupe:violator", typeSettings.tag ?? "");
+    addToggleCompat(form, "Clear Violator Tag", false);
     addToggleCompat(form, "Kick At Threshold", !!typeSettings.kickAtThreshold);
     addToggleCompat(form, "Kick If Tagged On Repeat", !!typeSettings.kickIfTaggedOnRepeat);
 
@@ -2497,13 +2555,21 @@ function openPunishmentTypeForm(player, key) {
       }
       if (response.canceled) return openNextTick(() => openPunishmentTypeMenu(player));
       const v = response.formValues ?? [];
-      const rawThreshold = parseInt(String(v[1] ?? "").trim(), 10);
-      let threshold = Number.isFinite(rawThreshold) ? rawThreshold : typeSettings.threshold;
-      if (!Number.isFinite(threshold)) {
-        threshold = 0;
-        try { player.sendMessage("§eThreshold value was invalid. Defaulting to 0."); } catch {}
+      const thresholdInput = String(v[1] ?? "").trim();
+      let threshold = typeSettings.threshold;
+      if (thresholdInput.length > 0) {
+        const parsedThreshold = parseInt(thresholdInput, 10);
+        if (Number.isFinite(parsedThreshold)) {
+          threshold = parsedThreshold;
+        } else {
+          try { player.sendMessage("§eThreshold value was invalid. Keeping previous value."); } catch {}
+        }
       }
-      const tagOverride = String(v[2] ?? "").trim().slice(0, 32);
+      const tagInput = String(v[2] ?? "").trim().slice(0, 32);
+      const clearTag = !!v[3];
+      const tagOverride = clearTag
+        ? ""
+        : (tagInput ? tagInput : typeSettings.tag);
 
       const updatedTypes = {
         ...globalConfig.punishments.types,
@@ -2512,8 +2578,8 @@ function openPunishmentTypeForm(player, key) {
           enabled: !!v[0],
           threshold: clampRangeInt(threshold, 0, 200, 0),
           tag: tagOverride,
-          kickAtThreshold: !!v[3],
-          kickIfTaggedOnRepeat: !!v[4],
+          kickAtThreshold: !!v[4],
+          kickIfTaggedOnRepeat: !!v[5],
         },
       };
 
@@ -2667,22 +2733,23 @@ function openRestrictedItemsViewer(player) {
 }
 // ModalFormData.textField compatibility wrapper.
 function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
-  // Two-argument form works across versions.
+  const defaultStr = String(defaultValue ?? "");
+  // Legacy overload: defaultValue string.
   try {
-    form.textField(label, placeholder);
+    form.textField(label, placeholder, defaultStr);
     return form;
-  } catch (e2) {
+  } catch (e1) {
     // Newer overload: options object.
     try {
-      form.textField(label, placeholder, { defaultValue: String(defaultValue ?? "") });
+      form.textField(label, placeholder, { defaultValue: defaultStr });
       return form;
-    } catch (e3) {
-      // Legacy overload: defaultValue string.
+    } catch (e2) {
+      // Fallback: no default support.
       try {
-        form.textField(label, placeholder, String(defaultValue ?? ""));
+        form.textField(label, placeholder);
         return form;
-      } catch (e4) {
-        dbgError("ui", `Unable to attach text field: ${e2} | ${e3} | ${e4}`);
+      } catch (e3) {
+        dbgError("ui", `Unable to attach text field: ${e1} | ${e2} | ${e3}`);
         return form;
       }
     }
@@ -2691,19 +2758,21 @@ function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
 
 // ModalFormData.toggle compatibility wrapper.
 function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
+  const defaultBool = !!defaultValue;
+  // Legacy overload: defaultValue boolean.
   try {
-    form.toggle(label);
+    form.toggle(label, defaultBool);
     return form;
   } catch (e1) {
     try {
-      const opts = { defaultValue: !!defaultValue };
+      const opts = { defaultValue: defaultBool };
       const tip = String(tooltip ?? "").trim();
       if (tip) opts.tooltip = tip;
       form.toggle(label, opts);
       return form;
     } catch (e2) {
       try {
-        form.toggle(label, !!defaultValue);
+        form.toggle(label);
         return form;
       } catch (e3) {
         dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
