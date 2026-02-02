@@ -59,7 +59,7 @@ const DEFAULT_GLOBAL_CONFIG = {
     punishmentTag: "",
     reasonTemplate: "Anti-Dupe: {TYPE} (Count: {COUNT}/{THRESHOLD})",
     cooldownTicks: 20,
-    publicKickMessage: false,
+    publicKickMessage: true,
     types: {
       ghost:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
       plant:   { enabled: true,  threshold: 1, tag: "", kickAtThreshold: false, kickIfTaggedOnRepeat: false },
@@ -848,6 +848,57 @@ function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
   return 0;
 }
 
+function getScoreEntryByName(objective, nameKey) {
+  if (!objective) return null;
+  try {
+    const scores = objective.getScores?.() ?? [];
+    for (const s of scores) {
+      const p = s?.participant;
+      const dn = p?.displayName;
+      if (dn && nameKey && dn === nameKey) {
+        return { score: s?.score ?? 0, participant: p };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function readScoreForName(objective, nameKey) {
+  if (!objective) return { found: false, score: 0, participant: null };
+  const entry = getScoreEntryByName(objective, nameKey);
+  if (entry) return { found: true, score: entry.score, participant: entry.participant };
+  try {
+    const v = objective.getScore?.(nameKey);
+    if (Number.isFinite(v)) return { found: true, score: v, participant: null };
+  } catch {}
+  return { found: false, score: 0, participant: null };
+}
+
+function resetScore(objective, nameKey) {
+  const info = readScoreForName(objective, nameKey);
+  if (!info.found) return { found: false, previous: 0 };
+  const prev = info.score ?? 0;
+  try {
+    if (typeof objective.setScore === "function") {
+      objective.setScore(nameKey, 0);
+      return { found: true, previous: prev };
+    }
+  } catch {}
+  try {
+    if (typeof objective.addScore === "function") {
+      objective.addScore(nameKey, -prev);
+      return { found: true, previous: prev };
+    }
+  } catch {}
+  try {
+    if (typeof objective.removeParticipant === "function") {
+      objective.removeParticipant(info.participant ?? nameKey);
+      return { found: true, previous: prev };
+    }
+  } catch {}
+  return { found: true, previous: prev };
+}
+
 const migratedViolationNames = new Set();
 
 function migrateViolationScoresForPlayer(player) {
@@ -1003,7 +1054,8 @@ function appendMitigation(base, addition) {
 }
 
 function renderPunishmentReason(template, typeLabel, count, threshold) {
-  const raw = String(template ?? "");
+  const rawInput = String(template ?? "").trim();
+  const raw = rawInput || DEFAULT_GLOBAL_CONFIG.punishments.reasonTemplate;
   return raw
     .replace(/\{TYPE\}/g, String(typeLabel))
     .replace(/\{COUNT\}/g, String(count))
@@ -1151,6 +1203,111 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
     dbgWarn("punish", `applyPunishment error: ${e}`);
     return "";
   }
+}
+
+function evaluateKickEligibilityForPlayer(player) {
+  if (!player) return null;
+  const name = scoreKeyForPlayer(player);
+  if (!name) return null;
+  if (player.hasTag?.(ADMIN_TAG)) return null;
+
+  if (!configLoaded) loadGlobalConfig();
+  const punish = globalConfig.punishments;
+  if (!punish?.enabled) return null;
+
+  const bypassTag = String(punish.bypassTag ?? "").trim();
+  if (bypassTag && player.hasTag?.(bypassTag)) {
+    dbgInfo("punish", `Join kick gated for ${name}: bypass tag present (${bypassTag}).`);
+    return null;
+  }
+
+  if (!ensureViolationObjectives()) return null;
+  migrateViolationScoresForPlayer(player);
+
+  const sb = world.scoreboard;
+  if (!sb) return null;
+
+  const keys = ["ghost", "plant", "hopper", "dropper", "illegal", "other"];
+  let best = null;
+  let sawOverThreshold = false;
+
+  for (const key of keys) {
+    const typeSettings = punish.types?.[key];
+    if (!typeSettings?.enabled) continue;
+    const threshold = clampRangeInt(typeSettings.threshold, 0, 200, 0);
+    if (threshold <= 0) continue;
+    const obj = sb.getObjective(objectiveIdForKey(key));
+    if (!obj) continue;
+    const typeScore = tryGetScoreByEntityOrName(obj, player, name);
+    if (typeScore >= threshold) {
+      sawOverThreshold = true;
+      if (!typeSettings.kickAtThreshold) {
+        dbgInfo("punish", `Join kick gated for ${name}: kick at threshold disabled for ${prettyTypeKey(key)}.`);
+        continue;
+      }
+      if (!punish.allowKick) continue;
+      const ratio = threshold > 0 ? typeScore / threshold : typeScore;
+      if (!best || ratio > best.ratio || (ratio === best.ratio && typeScore > best.typeScore)) {
+        best = { key, typeScore, threshold, ratio };
+      }
+    }
+  }
+
+  if (sawOverThreshold && !punish.allowKick) {
+    dbgInfo("punish", `Join kick gated for ${name}: global kicks disabled.`);
+  }
+
+  if (!best || !punish.allowKick) return null;
+
+  const now = system.currentTick;
+  const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+  const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 20);
+  if (now - last < cooldown) {
+    dbgInfo("punish", `Join kick gated for ${name}: cooldown active (${cooldown} ticks).`);
+    return null;
+  }
+
+  const typeLabel = prettyTypeKey(best.key);
+  const reason = renderPunishmentReason(
+    punish.reasonTemplate,
+    typeLabel,
+    best.typeScore,
+    best.threshold
+  );
+
+  return { key: best.key, typeScore: best.typeScore, threshold: best.threshold, typeLabel, reason };
+}
+
+async function kickPlayerForExistingViolations(player, details) {
+  if (!player || !details) return false;
+  const name = String(player?.name ?? "").trim();
+  if (!name) return false;
+  const now = system.currentTick;
+  const kicked = await tryKickPlayer(player, details.reason);
+  lastPunishTickByPlayerName.set(name, now);
+  if (!kicked) return false;
+
+  const pos = player.location ?? {};
+  const coordStr = (Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.z))
+    ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}`
+    : "Unknown";
+  const dimId = safeDimIdFromEntity(player);
+  const dimLabel = prettyDimension(dimId);
+
+  sendAdminAlert(
+    `§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked on join for existing §f${details.typeLabel}§r ` +
+    `§7violations (${details.typeScore}/${details.threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r`
+  );
+
+  const punish = globalConfig.punishments;
+  if (punish.publicKickMessage) {
+    for (const p of getPlayersSafe()) {
+      if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+        try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for §f${details.typeLabel}§r §7violations.`); } catch {}
+      }
+    }
+  }
+  return true;
 }
 
 function getViolationsTable() {
@@ -1564,6 +1721,15 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
     if (!initialSpawn || !player) return;
 
     migrateViolationScoresForPlayer(player);
+    runLater(() => {
+      try {
+        if (!player || player.isValid === false) return;
+        const details = evaluateKickEligibilityForPlayer(player);
+        if (details) kickPlayerForExistingViolations(player, details);
+      } catch (e) {
+        dbgWarn("punish", `Join enforcement failed: ${e}`);
+      }
+    }, 60);
 
     if (!configLoaded) loadGlobalConfig();
     if (!globalConfig.ghostPatch) {
@@ -2183,6 +2349,7 @@ function openPunishmentsMenu(player) {
       .body(getPunishmentSummaryLines().join("\n"))
       .button("Global Options")
       .button("Configure Dupe Types")
+      .button("Violation Resets")
       .button("Back");
 
     ForceOpen(player, form)
@@ -2194,6 +2361,7 @@ function openPunishmentsMenu(player) {
         if (res.canceled) return openNextTick(() => openMainMenu(player));
         if (res.selection === 0) openNextTick(() => openPunishmentGlobalOptionsHub(player));
         else if (res.selection === 1) openNextTick(() => openPunishmentTypeMenu(player));
+        else if (res.selection === 2) openNextTick(() => openViolationResetStart(player));
         else openNextTick(() => openMainMenu(player));
       })
       .catch((e) => {
@@ -2233,7 +2401,8 @@ function openPunishmentGlobalOptionsHub(player) {
         ].join("\n")
       )
       .button("Edit Settings")
-      .button("Kick Reason Template Help")
+      .button("Reason Template Help")
+      .button("Reset Reason Template to Default")
       .button("Back");
 
     ForceOpen(player, form).then((res) => {
@@ -2244,6 +2413,18 @@ function openPunishmentGlobalOptionsHub(player) {
       if (res.canceled) return openNextTick(() => openPunishmentsMenu(player));
       if (res.selection === 0) openNextTick(() => openPunishmentGlobalOptionsForm(player));
       else if (res.selection === 1) openNextTick(() => openPunishmentKickTemplateHelp(player));
+      else if (res.selection === 2) {
+        globalConfig = normalizeConfig({
+          ...globalConfig,
+          punishments: {
+            ...globalConfig.punishments,
+            reasonTemplate: DEFAULT_GLOBAL_CONFIG.punishments.reasonTemplate,
+          },
+        });
+        queueSaveGlobalConfig();
+        try { player.sendMessage("§aReason template reset to default."); } catch {}
+        openNextTick(() => openPunishmentGlobalOptionsHub(player));
+      }
       else openNextTick(() => openPunishmentsMenu(player));
     }).catch((e) => {
       dbgError("ui", `Global punishment options hub failed: ${e}`);
@@ -2303,6 +2484,237 @@ function openPunishmentKickTemplateHelp(player) {
     logConsoleWarn(`[Anti-Dupe] Kick Reason Template help build failed: ${e}`);
     notifyFormFailed(player, "Kick Reason Template Help");
     openNextTick(() => openPunishmentGlobalOptionsHub(player));
+  }
+}
+
+function getViolationScoresForName(nameKey) {
+  const scores = {
+    total: { score: 0, found: false },
+    ghost: { score: 0, found: false },
+    plant: { score: 0, found: false },
+    hopper: { score: 0, found: false },
+    dropper: { score: 0, found: false },
+    illegal: { score: 0, found: false },
+    other: { score: 0, found: false },
+  };
+
+  if (!ensureViolationObjectives()) return { scores, foundAny: false };
+  const sb = world.scoreboard;
+  if (!sb) return { scores, foundAny: false };
+
+  const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
+  const ghostObj = sb.getObjective(VIO_OBJ_GHOST);
+  const plantObj = sb.getObjective(VIO_OBJ_PLANT);
+  const hopperObj = sb.getObjective(VIO_OBJ_HOPPER);
+  const dropperObj = sb.getObjective(VIO_OBJ_DROPPER);
+  const illegalObj = sb.getObjective(VIO_OBJ_ILLEGAL);
+  const otherObj = sb.getObjective(VIO_OBJ_OTHER);
+
+  const total = readScoreForName(totalObj, nameKey);
+  const ghost = readScoreForName(ghostObj, nameKey);
+  const plant = readScoreForName(plantObj, nameKey);
+  const hopper = readScoreForName(hopperObj, nameKey);
+  const dropper = readScoreForName(dropperObj, nameKey);
+  const illegal = readScoreForName(illegalObj, nameKey);
+  const other = readScoreForName(otherObj, nameKey);
+
+  scores.total = { score: total.score, found: total.found };
+  scores.ghost = { score: ghost.score, found: ghost.found };
+  scores.plant = { score: plant.score, found: plant.found };
+  scores.hopper = { score: hopper.score, found: hopper.found };
+  scores.dropper = { score: dropper.score, found: dropper.found };
+  scores.illegal = { score: illegal.score, found: illegal.found };
+  scores.other = { score: other.score, found: other.found };
+
+  const foundAny = Object.values(scores).some((v) => v.found);
+  return { scores, foundAny };
+}
+
+function resetViolationScoresByName(nameKey, typeKey, resetTotal) {
+  if (!ensureViolationObjectives()) return { found: false, results: [] };
+  const sb = world.scoreboard;
+  if (!sb) return { found: false, results: [] };
+
+  const objectives = [];
+  if (typeKey === "all") {
+    objectives.push(VIO_OBJ_GHOST, VIO_OBJ_PLANT, VIO_OBJ_HOPPER, VIO_OBJ_DROPPER, VIO_OBJ_ILLEGAL, VIO_OBJ_OTHER);
+    if (resetTotal) objectives.push(VIO_OBJ_TOTAL);
+  } else if (typeKey === "total") {
+    objectives.push(VIO_OBJ_TOTAL);
+  } else {
+    objectives.push(objectiveIdForKey(typeKey));
+    if (resetTotal) objectives.push(VIO_OBJ_TOTAL);
+  }
+
+  let foundAny = false;
+  const results = [];
+  for (const objId of objectives) {
+    const obj = sb.getObjective(objId);
+    if (!obj) continue;
+    const res = resetScore(obj, nameKey);
+    results.push({ objId, ...res });
+    if (res.found) foundAny = true;
+  }
+  return { found: foundAny, results };
+}
+
+function openViolationResetStart(player) {
+  try {
+    dbgInfo("ui", "Opened Violation Reset Start.");
+
+    const form = new ModalFormData().title("Violation Resets");
+    addTextFieldCompat(form, "Player Name", "playerName", "");
+    addToggleCompat(form, "Reset All Types", false);
+    addToggleCompat(form, "Reset Total Score", true);
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Violation Resets");
+        return openNextTick(() => openPunishmentsMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openPunishmentsMenu(player));
+      const v = res.formValues ?? [];
+      const nameKey = String(v[0] ?? "").trim();
+      const resetAll = !!v[1];
+      const resetTotal = !!v[2];
+      if (!nameKey) {
+        try { player.sendMessage("§cEnter a player name to reset."); } catch {}
+        return openNextTick(() => openViolationResetStart(player));
+      }
+      if (resetAll) {
+        return openNextTick(() => openViolationResetConfirm(player, nameKey, "all", resetTotal));
+      }
+      openNextTick(() => openViolationResetTypeMenu(player, nameKey, resetTotal));
+    }).catch((e) => {
+      dbgError("ui", `Violation reset start failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Violation reset start failed: ${e}`);
+      notifyFormFailed(player, "Violation Resets");
+      openNextTick(() => openPunishmentsMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Violation reset start build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Violation reset start build failed: ${e}`);
+    notifyFormFailed(player, "Violation Resets");
+    openNextTick(() => openPunishmentsMenu(player));
+  }
+}
+
+function openViolationResetTypeMenu(player, nameKey, resetTotal) {
+  try {
+    dbgInfo("ui", `Opened Violation Reset Type Menu for ${nameKey}.`);
+    const form = new ActionFormData()
+      .title("Select Violation Type")
+      .body(`Player: ${nameKey}`)
+      .button("Ghost Stack")
+      .button("Piston")
+      .button("Hopper")
+      .button("Dropper")
+      .button("Illegal Stack")
+      .button("Other")
+      .button("Total Only")
+      .button("Back");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Violation Reset Type");
+        return openNextTick(() => openViolationResetStart(player));
+      }
+      if (res.canceled) return openNextTick(() => openViolationResetStart(player));
+      if (res.selection === 0) openNextTick(() => openViolationResetConfirm(player, nameKey, "ghost", resetTotal));
+      else if (res.selection === 1) openNextTick(() => openViolationResetConfirm(player, nameKey, "plant", resetTotal));
+      else if (res.selection === 2) openNextTick(() => openViolationResetConfirm(player, nameKey, "hopper", resetTotal));
+      else if (res.selection === 3) openNextTick(() => openViolationResetConfirm(player, nameKey, "dropper", resetTotal));
+      else if (res.selection === 4) openNextTick(() => openViolationResetConfirm(player, nameKey, "illegal", resetTotal));
+      else if (res.selection === 5) openNextTick(() => openViolationResetConfirm(player, nameKey, "other", resetTotal));
+      else if (res.selection === 6) openNextTick(() => openViolationResetConfirm(player, nameKey, "total", true));
+      else openNextTick(() => openViolationResetStart(player));
+    }).catch((e) => {
+      dbgError("ui", `Violation reset type menu failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Violation reset type menu failed: ${e}`);
+      notifyFormFailed(player, "Violation Reset Type");
+      openNextTick(() => openViolationResetStart(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Violation reset type menu build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Violation reset type menu build failed: ${e}`);
+    notifyFormFailed(player, "Violation Reset Type");
+    openNextTick(() => openViolationResetStart(player));
+  }
+}
+
+function openViolationResetConfirm(player, nameKey, typeKey, resetTotal) {
+  try {
+    dbgInfo("ui", `Opened Violation Reset Confirm for ${nameKey}.`);
+    const { scores, foundAny } = getViolationScoresForName(nameKey);
+    if (!foundAny) {
+      try { player.sendMessage("§eNo scores found for that player."); } catch {}
+      return openNextTick(() => openViolationResetStart(player));
+    }
+
+    const lines = [];
+    const targetLabel = typeKey === "all"
+      ? "All Types"
+      : (typeKey === "total" ? "Total Only" : prettyTypeKey(typeKey));
+
+    lines.push(`Player: ${nameKey}`);
+    lines.push(`Action: Reset ${targetLabel}${resetTotal && typeKey !== "total" ? " + Total" : ""}`);
+    lines.push("");
+    lines.push("Current Scores:");
+
+    if (typeKey === "all") {
+      lines.push(`Total: ${scores.total.score}`);
+      lines.push(`Ghost: ${scores.ghost.score}`);
+      lines.push(`Piston: ${scores.plant.score}`);
+      lines.push(`Hopper: ${scores.hopper.score}`);
+      lines.push(`Dropper: ${scores.dropper.score}`);
+      lines.push(`Illegal: ${scores.illegal.score}`);
+      lines.push(`Other: ${scores.other.score}`);
+    } else if (typeKey === "total") {
+      lines.push(`Total: ${scores.total.score}`);
+    } else {
+      const keyMap = {
+        ghost: scores.ghost,
+        plant: scores.plant,
+        hopper: scores.hopper,
+        dropper: scores.dropper,
+        illegal: scores.illegal,
+        other: scores.other,
+      };
+      const entry = keyMap[typeKey];
+      lines.push(`${prettyTypeKey(typeKey)}: ${entry?.score ?? 0}`);
+      if (resetTotal) lines.push(`Total: ${scores.total.score}`);
+    }
+
+    const form = new MessageFormData()
+      .title("Confirm Violation Reset")
+      .body(lines.join("\n"))
+      .button1("Confirm")
+      .button2("Cancel");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Violation Reset Confirm");
+        return openNextTick(() => openViolationResetStart(player));
+      }
+      if (res.canceled || res.selection === 1) return openNextTick(() => openViolationResetStart(player));
+      const result = resetViolationScoresByName(nameKey, typeKey, resetTotal);
+      if (!result.found) {
+        try { player.sendMessage("§eNo scores found for that player/type."); } catch {}
+        return openNextTick(() => openViolationResetStart(player));
+      }
+      try { player.sendMessage(`§aViolation scores reset for ${nameKey}.`); } catch {}
+      openNextTick(() => openViolationResetStart(player));
+    }).catch((e) => {
+      dbgError("ui", `Violation reset confirm failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Violation reset confirm failed: ${e}`);
+      notifyFormFailed(player, "Violation Reset Confirm");
+      openNextTick(() => openViolationResetStart(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Violation reset confirm build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Violation reset confirm build failed: ${e}`);
+    notifyFormFailed(player, "Violation Reset Confirm");
+    openNextTick(() => openViolationResetStart(player));
   }
 }
 
@@ -2375,17 +2787,10 @@ function openPunishmentGlobalOptionsForm(player) {
         form,
         "Kick Reason Template",
         "Use {TYPE}, {COUNT}, {THRESHOLD}",
-        punish.reasonTemplate ?? ""
+        punish.reasonTemplate ?? DEFAULT_GLOBAL_CONFIG.punishments.reasonTemplate
       );
     } catch (e) {
       dbgWarn("ui", `Punishment Configuration field failed: Kick Reason Template text field: ${e}`);
-      throw e;
-    }
-    try {
-      dbgInfo("ui", "adding field: Clear Reason Template toggle");
-      addToggleCompat(form, "Clear Reason Template", false);
-    } catch (e) {
-      dbgWarn("ui", `Punishment Configuration field failed: Clear Reason Template toggle: ${e}`);
       throw e;
     }
     try {
@@ -2408,16 +2813,15 @@ function openPunishmentGlobalOptionsForm(player) {
       const punishmentInput = String(v[4] ?? "").trim().slice(0, 32);
       const clearPunishment = !!v[5];
       const reasonInput = String(v[7] ?? "").trim().slice(0, 120);
-      const clearReason = !!v[8];
       const bypassTag = clearBypass
         ? ""
         : (bypassInput ? bypassInput : globalConfig.punishments.bypassTag);
       const punishmentTag = clearPunishment
         ? ""
         : (punishmentInput ? punishmentInput : globalConfig.punishments.punishmentTag);
-      const reasonTemplate = clearReason
-        ? ""
-        : (reasonInput ? reasonInput : globalConfig.punishments.reasonTemplate);
+      const reasonTemplate = reasonInput
+        ? reasonInput
+        : globalConfig.punishments.reasonTemplate;
 
       globalConfig = normalizeConfig({
         ...globalConfig,
@@ -2429,7 +2833,7 @@ function openPunishmentGlobalOptionsForm(player) {
           punishmentTag,
           cooldownTicks: clampRangeInt(v[6], 0, 200, globalConfig.punishments.cooldownTicks),
           reasonTemplate,
-          publicKickMessage: !!v[9],
+          publicKickMessage: !!v[8],
           types: globalConfig.punishments.types,
         },
       });
