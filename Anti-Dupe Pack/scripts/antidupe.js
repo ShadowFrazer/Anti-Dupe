@@ -89,6 +89,8 @@ const GLOBAL_PARTICIPANT = "#global";
 
 const VIO_STATS_KEY = "antidupe:vstats";
 const VIO_STATS_MAX_CHARS = 4000;
+const VIOLATORS_DB_KEY = "violators_db";
+const VIOLATORS_DB_MAX_CHARS = 8000;
 
 const DEFAULT_VIO_STATS = {
   globalCount: 0,
@@ -646,6 +648,95 @@ let vioStatsSaveQueued = false;
 let vioObjectivesReady = false;
 let vioInitAttempted = false;
 
+// --- Violators DB ---
+let violatorsDb = {};
+let violatorsDbLoaded = false;
+let violatorsDbDirty = false;
+let violatorsDbSaveQueued = false;
+
+function normalizeViolatorsDb(obj) {
+  if (!obj || typeof obj !== "object") return {};
+  const out = {};
+  for (const [key, raw] of Object.entries(obj)) {
+    if (!key) continue;
+    const rec = raw && typeof raw === "object" ? raw : {};
+    const kickLoop = rec.kickLoop && typeof rec.kickLoop === "object" ? rec.kickLoop : {};
+    out[key] = {
+      name: typeof rec.name === "string" ? rec.name : "Unknown",
+      violations: Number.isFinite(rec.violations) ? rec.violations : 0,
+      lastViolationAt: Number.isFinite(rec.lastViolationAt) ? rec.lastViolationAt : 0,
+      reason: typeof rec.reason === "string" ? rec.reason : "",
+      kickLoop: {
+        enabled: !!kickLoop.enabled,
+        since: Number.isFinite(kickLoop.since) ? kickLoop.since : 0,
+        lastKickAt: Number.isFinite(kickLoop.lastKickAt) ? kickLoop.lastKickAt : 0,
+        intervalSec: Number.isFinite(kickLoop.intervalSec) ? kickLoop.intervalSec : 10,
+      },
+    };
+  }
+  return out;
+}
+
+function loadViolatorsDb() {
+  if (violatorsDbLoaded) return;
+  violatorsDbLoaded = true;
+
+  if (!persistenceEnabled) {
+    violatorsDb = {};
+    dbgWarn("violators", "Dynamic properties unavailable; violators DB will not persist.");
+    return;
+  }
+
+  try {
+    const raw = world.getDynamicProperty(VIOLATORS_DB_KEY);
+    if (typeof raw !== "string" || raw.length === 0) {
+      violatorsDb = {};
+      dbgInfo("violators", "No saved violators DB found; starting empty.");
+      return;
+    }
+    violatorsDb = normalizeViolatorsDb(JSON.parse(raw));
+    dbgInfo("violators", "Loaded violators DB.");
+  } catch (e) {
+    dbgError("violators", `Unable to load violators DB; reset to empty: ${e}`);
+    violatorsDb = {};
+  }
+}
+
+function saveViolatorsDbNow() {
+  if (!persistenceEnabled) return;
+  if (!violatorsDbDirty) return;
+
+  try {
+    const raw = safeStringifyWithCap(violatorsDb, VIOLATORS_DB_MAX_CHARS, {});
+    world.setDynamicProperty(VIOLATORS_DB_KEY, raw);
+    violatorsDbDirty = false;
+    dbgInfo("violators", "Violators DB saved.");
+  } catch (e) {
+    dbgError("violators", `Unable to save violators DB: ${e}`);
+  }
+}
+
+function queueSaveViolatorsDb() {
+  violatorsDbDirty = true;
+  if (!persistenceEnabled) return;
+  if (violatorsDbSaveQueued) return;
+
+  violatorsDbSaveQueued = true;
+  runLater(() => {
+    violatorsDbSaveQueued = false;
+    saveViolatorsDbNow();
+  }, 40);
+}
+
+system.runInterval(() => {
+  try { saveViolatorsDbNow(); } catch {}
+}, 200);
+
+runLater(loadViolatorsDb, 1);
+try {
+  world.afterEvents?.worldInitialize?.subscribe?.(() => runLater(loadViolatorsDb, 1));
+} catch {}
+
 function normalizeVioStats(obj) {
   const out = JSON.parse(JSON.stringify(DEFAULT_VIO_STATS));
   if (!obj || typeof obj !== "object") return out;
@@ -818,9 +909,31 @@ function scoreKeyForPlayer(player) {
   return String(player?.name ?? player?.nameTag ?? "Unknown").trim();
 }
 
+function violatorKeyForPlayer(player) {
+  const id = player?.id ?? player?.xuid ?? player?.uuid;
+  if (id !== undefined && id !== null) {
+    const key = String(id).trim();
+    if (key) return key;
+  }
+  return scoreKeyForPlayer(player);
+}
+
 function isBadOfflineScoreboardName(name) {
   const s = String(name ?? "");
   return s.includes("commands.scoreboard.players.offlinePlayerName");
+}
+
+function formatAgo(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "Unknown";
+  const diff = Math.max(0, Date.now() - ms);
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 48) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
 }
 
 function tryGetScoreByEntityOrName(objective, entity, nameFallback) {
@@ -1035,12 +1148,80 @@ function recordViolation(offender, incidentType) {
       }
     } catch {}
 
+    try {
+      updateViolatorFromViolation(offender, total, incidentType);
+    } catch (e) {
+      dbgWarn("violators", `updateViolatorFromViolation error: ${e}`);
+    }
+
     return { key, total, typeScore, global };
   } catch (e) {
     console.warn(`[Anti-Dupe] recordViolation failed: ${e}`);
     dbgError("violations", `recordViolation error: ${e}`);
     return { key: "other", total: 0, typeScore: 0, global: 0 };
   }
+}
+
+function updateViolatorFromViolation(player, total, incidentType) {
+  if (!player) return;
+  if (!violatorsDbLoaded) loadViolatorsDb();
+  const key = violatorKeyForPlayer(player);
+  if (!key) return;
+  const name = scoreKeyForPlayer(player);
+  const now = Date.now();
+  const existing = violatorsDb[key] ?? {};
+  const violations = Number.isFinite(total) ? total : (existing.violations ?? 0);
+  violatorsDb[key] = {
+    ...existing,
+    name,
+    violations,
+    lastViolationAt: now,
+    reason: String(incidentType ?? ""),
+    kickLoop: {
+      enabled: !!existing?.kickLoop?.enabled,
+      since: Number.isFinite(existing?.kickLoop?.since) ? existing.kickLoop.since : 0,
+      lastKickAt: Number.isFinite(existing?.kickLoop?.lastKickAt) ? existing.kickLoop.lastKickAt : 0,
+      intervalSec: Number.isFinite(existing?.kickLoop?.intervalSec) ? existing.kickLoop.intervalSec : 10,
+    },
+  };
+  queueSaveViolatorsDb();
+}
+
+function updateViolatorNameForPlayer(player) {
+  if (!player) return;
+  if (!violatorsDbLoaded) loadViolatorsDb();
+  const key = violatorKeyForPlayer(player);
+  if (!key) return;
+  const name = scoreKeyForPlayer(player);
+  const existing = violatorsDb[key];
+  if (!existing) return;
+  if (existing.name !== name) {
+    violatorsDb[key] = { ...existing, name };
+    queueSaveViolatorsDb();
+  }
+}
+
+function isKickLoopedByKey(key) {
+  if (!violatorsDbLoaded) loadViolatorsDb();
+  const entry = violatorsDb[key];
+  return !!entry?.kickLoop?.enabled;
+}
+
+function setKickLoopForKey(key, enabled) {
+  if (!violatorsDbLoaded) loadViolatorsDb();
+  const entry = violatorsDb[key] ?? { name: "Unknown", violations: 0, lastViolationAt: 0, reason: "" };
+  const now = Date.now();
+  const kickLoop = entry.kickLoop && typeof entry.kickLoop === "object" ? entry.kickLoop : {};
+  violatorsDb[key] = {
+    ...entry,
+    kickLoop: {
+      enabled: !!enabled,
+      since: enabled ? (kickLoop.since || now) : kickLoop.since || 0,
+      lastKickAt: kickLoop.lastKickAt || 0,
+      intervalSec: Number.isFinite(kickLoop.intervalSec) ? kickLoop.intervalSec : 10,
+    },
+  };
+  queueSaveViolatorsDb();
 }
 
 const lastPunishTickByPlayerName = new Map();
@@ -1308,6 +1489,45 @@ async function kickPlayerForExistingViolations(player, details) {
     }
   }
   return true;
+}
+
+async function enforceKickLoopOnJoin(player) {
+  if (!player) return false;
+  if (player.hasTag?.(ADMIN_TAG)) return false;
+  if (!configLoaded) loadGlobalConfig();
+  const bypassTag = String(globalConfig.punishments?.bypassTag ?? "").trim();
+  if (bypassTag && player.hasTag?.(bypassTag)) return false;
+  if (!violatorsDbLoaded) loadViolatorsDb();
+  const key = violatorKeyForPlayer(player);
+  if (!key) return false;
+  const entry = violatorsDb[key];
+  if (!entry?.kickLoop?.enabled) return false;
+  const now = Date.now();
+  const intervalSec = Number.isFinite(entry.kickLoop.intervalSec) ? entry.kickLoop.intervalSec : 10;
+  const minMs = Math.max(1, intervalSec) * 1000;
+  const lastKickAt = Number.isFinite(entry.kickLoop.lastKickAt) ? entry.kickLoop.lastKickAt : 0;
+  if (lastKickAt && now - lastKickAt < minMs) return false;
+
+  const name = scoreKeyForPlayer(player);
+  const reason = renderPunishmentReason(
+    globalConfig.punishments?.reasonTemplate,
+    "Kick Loop",
+    entry.violations ?? 0,
+    0
+  );
+  const kicked = await tryKickPlayer(player, reason);
+  if (kicked) {
+    violatorsDb[key] = {
+      ...entry,
+      name,
+      kickLoop: {
+        ...entry.kickLoop,
+        lastKickAt: now,
+      },
+    };
+    queueSaveViolatorsDb();
+  }
+  return kicked;
 }
 
 function getViolationsTable() {
@@ -1724,6 +1944,8 @@ world.afterEvents.playerSpawn.subscribe(({ player, initialSpawn }) => {
     runLater(() => {
       try {
         if (!player || player.isValid === false) return;
+        updateViolatorNameForPlayer(player);
+        enforceKickLoopOnJoin(player);
         const details = evaluateKickEligibilityForPlayer(player);
         if (details) kickPlayerForExistingViolations(player, details);
       } catch (e) {
@@ -2349,7 +2571,7 @@ function openPunishmentsMenu(player) {
       .body(getPunishmentSummaryLines().join("\n"))
       .button("Global Options")
       .button("Configure Dupe Types")
-      .button("Violation Resets")
+      .button("Violators")
       .button("Back");
 
     ForceOpen(player, form)
@@ -2361,7 +2583,7 @@ function openPunishmentsMenu(player) {
         if (res.canceled) return openNextTick(() => openMainMenu(player));
         if (res.selection === 0) openNextTick(() => openPunishmentGlobalOptionsHub(player));
         else if (res.selection === 1) openNextTick(() => openPunishmentTypeMenu(player));
-        else if (res.selection === 2) openNextTick(() => openViolationResetStart(player));
+        else if (res.selection === 2) openNextTick(() => openViolatorsMenu(player));
         else openNextTick(() => openMainMenu(player));
       })
       .catch((e) => {
@@ -2716,6 +2938,325 @@ function openViolationResetConfirm(player, nameKey, typeKey, resetTotal) {
     notifyFormFailed(player, "Violation Reset Confirm");
     openNextTick(() => openViolationResetStart(player));
   }
+}
+
+function buildViolatorEntries(filter = "all") {
+  if (!violatorsDbLoaded) loadViolatorsDb();
+  ensureViolationObjectives();
+  const entries = new Map();
+
+  for (const [key, rec] of Object.entries(violatorsDb)) {
+    if (!key) continue;
+    const kickLoopEnabled = !!rec?.kickLoop?.enabled;
+    if (filter === "kickLoopOnly" && !kickLoopEnabled) continue;
+    entries.set(key, {
+      key,
+      name: rec?.name ?? "Unknown",
+      violations: Number.isFinite(rec?.violations) ? rec.violations : 0,
+      lastViolationAt: Number.isFinite(rec?.lastViolationAt) ? rec.lastViolationAt : 0,
+      reason: rec?.reason ?? "",
+      kickLoop: rec?.kickLoop ?? { enabled: false },
+    });
+  }
+
+  try {
+    const sb = world.scoreboard;
+    const totalObj = sb?.getObjective?.(VIO_OBJ_TOTAL);
+    const scores = totalObj?.getScores?.() ?? [];
+    for (const s of scores) {
+      const participant = s?.participant;
+      const name = participant?.displayName ?? "";
+      if (!name || name === GLOBAL_PARTICIPANT) continue;
+      if (isBadOfflineScoreboardName(name)) continue;
+      const total = s?.score ?? 0;
+      if (total <= 0) continue;
+      if (!entries.has(name)) {
+        if (filter === "kickLoopOnly") continue;
+        entries.set(name, {
+          key: name,
+          name,
+          violations: total,
+          lastViolationAt: 0,
+          reason: "",
+          kickLoop: { enabled: false },
+        });
+      } else {
+        const current = entries.get(name);
+        if (current && total > current.violations) current.violations = total;
+      }
+    }
+  } catch (e) {
+    dbgWarn("violators", `Unable to read violator scores: ${e}`);
+  }
+
+  const list = Array.from(entries.values());
+  list.sort((a, b) => {
+    const aLoop = a.kickLoop?.enabled ? 1 : 0;
+    const bLoop = b.kickLoop?.enabled ? 1 : 0;
+    if (aLoop !== bLoop) return bLoop - aLoop;
+    if (b.violations !== a.violations) return b.violations - a.violations;
+    return (b.lastViolationAt || 0) - (a.lastViolationAt || 0);
+  });
+
+  return list;
+}
+
+function openViolatorsMenu(player) {
+  try {
+    dbgInfo("ui", "Opened Violators Menu.");
+    const body = [
+      "Manage violators and kick loops.",
+      "Violation Resets: reset scoreboard counts.",
+      "Violator List: all known violators.",
+      "Kick-Looped: only enforced kick loops.",
+    ].join("\n");
+
+    const form = new ActionFormData()
+      .title("Violators")
+      .body(body)
+      .button("Violation Resets")
+      .button("Violator List")
+      .button("Kick-Looped Violators")
+      .button("Back");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Violators Menu");
+        return openNextTick(() => openPunishmentsMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openPunishmentsMenu(player));
+      if (res.selection === 0) openNextTick(() => openViolationResetStart(player));
+      else if (res.selection === 1) openNextTick(() => openViolatorList(player, "all", 0));
+      else if (res.selection === 2) openNextTick(() => openViolatorList(player, "kickLoopOnly", 0));
+      else openNextTick(() => openPunishmentsMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Violators menu submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Violators menu submit failed: ${e}`);
+      notifyFormFailed(player, "Violators Menu");
+      openNextTick(() => openPunishmentsMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Violators menu build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Violators menu build failed: ${e}`);
+    notifyFormFailed(player, "Violators Menu");
+    openNextTick(() => openPunishmentsMenu(player));
+  }
+}
+
+function openViolatorList(player, filter = "all", pageIndex = 0) {
+  try {
+    dbgInfo("ui", `Opened Violator List (${filter}) page ${pageIndex}.`);
+    const pageSize = 12;
+    const entries = buildViolatorEntries(filter);
+    if (!entries.length) {
+      const empty = new ActionFormData()
+        .title("Violators")
+        .body("No violators found.")
+        .button("Back");
+      return ForceOpen(player, empty).then((res) => {
+        if (!res) {
+          notifyFormFailed(player, "Violator List");
+          return openNextTick(() => openViolatorsMenu(player));
+        }
+        openNextTick(() => openViolatorsMenu(player));
+      }).catch((e) => {
+        dbgError("ui", `Violator list empty submit failed: ${e}`);
+        logConsoleWarn(`[Anti-Dupe] Violator list empty submit failed: ${e}`);
+        notifyFormFailed(player, "Violator List");
+        openNextTick(() => openViolatorsMenu(player));
+      });
+    }
+
+    const start = pageIndex * pageSize;
+    const page = entries.slice(start, start + pageSize);
+
+    const form = new ActionFormData()
+      .title("Violators")
+      .body(`Showing ${start + 1}-${Math.min(start + page.length, entries.length)} of ${entries.length}`);
+
+    for (const entry of page) {
+      const loopStatus = entry.kickLoop?.enabled ? "ON" : "OFF";
+      const last = entry.lastViolationAt ? formatAgo(entry.lastViolationAt) : "Unknown";
+      form.button(`${entry.name} | v:${entry.violations} | KickLoop:${loopStatus} | Last:${last}`);
+    }
+
+    if (pageIndex > 0) form.button("← Prev Page");
+    if (start + page.length < entries.length) form.button("Next Page →");
+    form.button("Back");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Violator List");
+        return openNextTick(() => openViolatorsMenu(player));
+      }
+      if (res.canceled) return openNextTick(() => openViolatorsMenu(player));
+
+      const selection = res.selection ?? -1;
+      if (selection >= 0 && selection < page.length) {
+        const entry = page[selection];
+        return openNextTick(() => openViolatorDetail(player, entry, filter, pageIndex));
+      }
+
+      let index = page.length;
+      if (pageIndex > 0) {
+        if (selection === index) return openNextTick(() => openViolatorList(player, filter, pageIndex - 1));
+        index += 1;
+      }
+      if (start + page.length < entries.length) {
+        if (selection === index) return openNextTick(() => openViolatorList(player, filter, pageIndex + 1));
+        index += 1;
+      }
+      openNextTick(() => openViolatorsMenu(player));
+    }).catch((e) => {
+      dbgError("ui", `Violator list submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Violator list submit failed: ${e}`);
+      notifyFormFailed(player, "Violator List");
+      openNextTick(() => openViolatorsMenu(player));
+    });
+  } catch (e) {
+    dbgError("ui", `Violator list build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Violator list build failed: ${e}`);
+    notifyFormFailed(player, "Violator List");
+    openNextTick(() => openViolatorsMenu(player));
+  }
+}
+
+function openViolatorDetail(player, entry, filter = "all", pageIndex = 0) {
+  try {
+    dbgInfo("ui", `Opened Violator Detail for ${entry?.name ?? "Unknown"}.`);
+    const key = entry?.key ?? "";
+    const name = entry?.name ?? "Unknown";
+    const violations = entry?.violations ?? 0;
+    const lastViolationAt = entry?.lastViolationAt ?? 0;
+    const reason = entry?.reason ?? "";
+    const kickLoop = entry?.kickLoop ?? {};
+
+    const body = [
+      `ID: ${key || "Unknown"}`,
+      `Name: ${name}`,
+      `Violations: ${violations}`,
+      `Last Violation: ${lastViolationAt ? formatAgo(lastViolationAt) : "Unknown"}`,
+      reason ? `Reason: ${reason}` : "",
+      "",
+      `Kick Loop: ${kickLoop.enabled ? "ON" : "OFF"}`,
+      kickLoop.since ? `Since: ${formatAgo(kickLoop.since)}` : "",
+      kickLoop.lastKickAt ? `Last Kick: ${formatAgo(kickLoop.lastKickAt)}` : "",
+      Number.isFinite(kickLoop.intervalSec) ? `Interval: ${kickLoop.intervalSec}s` : "",
+    ].filter(Boolean).join("\n");
+
+    const toggleLabel = kickLoop.enabled ? "Toggle Kick Loop (Off)" : "Toggle Kick Loop (On)";
+
+    const form = new ActionFormData()
+      .title(`Violator: ${name}`)
+      .body(body)
+      .button(toggleLabel)
+      .button("Reset Violations")
+      .button("Remove From Violators List")
+      .button("Back");
+
+    ForceOpen(player, form).then((res) => {
+      if (!res) {
+        notifyFormFailed(player, "Violator Detail");
+        return openNextTick(() => openViolatorList(player, filter, pageIndex));
+      }
+      if (res.canceled) return openNextTick(() => openViolatorList(player, filter, pageIndex));
+      if (res.selection === 0) return openNextTick(() => toggleViolatorKickLoop(player, entry, filter, pageIndex));
+      if (res.selection === 1) return openNextTick(() => confirmViolatorReset(player, entry, filter, pageIndex));
+      if (res.selection === 2) return openNextTick(() => confirmRemoveViolator(player, entry, filter, pageIndex));
+      openNextTick(() => openViolatorList(player, filter, pageIndex));
+    }).catch((e) => {
+      dbgError("ui", `Violator detail submit failed: ${e}`);
+      logConsoleWarn(`[Anti-Dupe] Violator detail submit failed: ${e}`);
+      notifyFormFailed(player, "Violator Detail");
+      openNextTick(() => openViolatorList(player, filter, pageIndex));
+    });
+  } catch (e) {
+    dbgError("ui", `Violator detail build failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Violator detail build failed: ${e}`);
+    notifyFormFailed(player, "Violator Detail");
+    openNextTick(() => openViolatorList(player, filter, pageIndex));
+  }
+}
+
+function toggleViolatorKickLoop(player, entry, filter, pageIndex) {
+  const key = entry?.key ?? "";
+  if (!key) return openNextTick(() => openViolatorList(player, filter, pageIndex));
+  const enabled = !entry?.kickLoop?.enabled;
+  setKickLoopForKey(key, enabled);
+  try { player.sendMessage(`§aKick loop ${enabled ? "enabled" : "disabled"} for ${entry?.name ?? "player"}.`); } catch {}
+  openNextTick(() => openViolatorList(player, filter, pageIndex));
+}
+
+function confirmViolatorReset(player, entry, filter, pageIndex) {
+  const nameKey = entry?.name ?? entry?.key ?? "";
+  if (!nameKey) return openNextTick(() => openViolatorList(player, filter, pageIndex));
+  const form = new MessageFormData()
+    .title("Reset Violations")
+    .body(`Reset violations for ${nameKey}?\nThis clears scoreboard counts for this name.`)
+    .button1("Cancel")
+    .button2("Reset");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res) {
+      notifyFormFailed(player, "Reset Violations");
+      return openNextTick(() => openViolatorList(player, filter, pageIndex));
+    }
+    if (res.canceled || res.selection === 0) return openNextTick(() => openViolatorList(player, filter, pageIndex));
+    resetViolationScoresByName(nameKey, "all", true);
+    if (!violatorsDbLoaded) loadViolatorsDb();
+    const key = entry?.key ?? "";
+    const existing = violatorsDb[key];
+    if (existing) {
+      const kickLoopEnabled = !!existing?.kickLoop?.enabled;
+      if (kickLoopEnabled) {
+        violatorsDb[key] = { ...existing, violations: 0, lastViolationAt: 0, reason: "" };
+      } else {
+        delete violatorsDb[key];
+      }
+      queueSaveViolatorsDb();
+    }
+    try { player.sendMessage(`§aViolations reset for ${nameKey}.`); } catch {}
+    openNextTick(() => openViolatorList(player, filter, pageIndex));
+  }).catch((e) => {
+    dbgError("ui", `Reset violator confirm failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Reset violator confirm failed: ${e}`);
+    notifyFormFailed(player, "Reset Violations");
+    openNextTick(() => openViolatorList(player, filter, pageIndex));
+  });
+}
+
+function confirmRemoveViolator(player, entry, filter, pageIndex) {
+  const key = entry?.key ?? "";
+  if (!key) return openNextTick(() => openViolatorList(player, filter, pageIndex));
+  const kickLoopEnabled = !!entry?.kickLoop?.enabled;
+  if (kickLoopEnabled) {
+    try { player.sendMessage("§eDisable kick loop before removing this entry."); } catch {}
+    return openNextTick(() => openViolatorList(player, filter, pageIndex));
+  }
+
+  const form = new MessageFormData()
+    .title("Remove Violator")
+    .body(`Remove ${entry?.name ?? "player"} from violators list?`)
+    .button1("Cancel")
+    .button2("Remove");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res) {
+      notifyFormFailed(player, "Remove Violator");
+      return openNextTick(() => openViolatorList(player, filter, pageIndex));
+    }
+    if (res.canceled || res.selection === 0) return openNextTick(() => openViolatorList(player, filter, pageIndex));
+    if (!violatorsDbLoaded) loadViolatorsDb();
+    delete violatorsDb[key];
+    queueSaveViolatorsDb();
+    try { player.sendMessage(`§aRemoved ${entry?.name ?? "player"} from violators.`); } catch {}
+    openNextTick(() => openViolatorList(player, filter, pageIndex));
+  }).catch((e) => {
+    dbgError("ui", `Remove violator confirm failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Remove violator confirm failed: ${e}`);
+    notifyFormFailed(player, "Remove Violator");
+    openNextTick(() => openViolatorList(player, filter, pageIndex));
+  });
 }
 
 function openPunishmentGlobalOptionsForm(player) {
@@ -3181,11 +3722,25 @@ function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
       } catch (e3) {
         dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
         return form;
+      } catch (e2) {
+        try {
+          form.slider(label, min, max);
+          if (!sliderCompatLogged) {
+            const msg = "Slider overload active: slider(label, min, max)";
+            dbgInfo("ui", msg);
+            sliderCompatLogged = true;
+          }
+          return form;
+        } catch (e3) {
+          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
+          return form;
+        }
       }
     }
+    dbgError("ui", `slider attach failed: ${e1}`);
+    return form;
   }
 }
-
 
 // ModalFormData.slider compatibility wrapper.
 let sliderCompatLogged = false;
