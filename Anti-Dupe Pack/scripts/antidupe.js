@@ -3186,6 +3186,7 @@ function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
   }
 }
 
+
 // ModalFormData.slider compatibility wrapper.
 let sliderCompatLogged = false;
 function addSliderCompat(form, label, min, max, step, defaultValue) {
@@ -3227,31 +3228,6 @@ function addSliderCompat(form, label, min, max, step, defaultValue) {
   }
 }
 
-// ModalFormData.toggle compatibility wrapper.
-function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
-  const defaultBool = !!defaultValue;
-  // Legacy overload: defaultValue boolean.
-  try {
-    form.toggle(label, defaultBool);
-    return form;
-  } catch (e1) {
-    try {
-      const opts = { defaultValue: defaultBool };
-      const tip = String(tooltip ?? "").trim();
-      if (tip) opts.tooltip = tip;
-      form.toggle(label, opts);
-      return form;
-    } catch (e2) {
-      try {
-        form.toggle(label);
-        return form;
-      } catch (e3) {
-        dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
-        return form;
-      }
-    }
-  }
-}
 
 
 function openAddRestrictedItemForm(player) {
