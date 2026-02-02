@@ -3722,8 +3722,23 @@ function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
       } catch (e3) {
         dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
         return form;
+      } catch (e2) {
+        try {
+          form.slider(label, min, max);
+          if (!sliderCompatLogged) {
+            const msg = "Slider overload active: slider(label, min, max)";
+            dbgInfo("ui", msg);
+            sliderCompatLogged = true;
+          }
+          return form;
+        } catch (e3) {
+          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
+          return form;
+        }
       }
     }
+    dbgError("ui", `slider attach failed: ${e1}`);
+    return form;
   }
 }
 
