@@ -3679,65 +3679,54 @@ function openRestrictedItemsViewer(player) {
 // ModalFormData.textField compatibility wrapper.
 function addTextFieldCompat(form, label, placeholder = "", defaultValue = "") {
   const defaultStr = String(defaultValue ?? "");
-  // Legacy overload: defaultValue string.
+
+  // Legacy overload: textField(label, placeholder, defaultValue)
   try {
     form.textField(label, placeholder, defaultStr);
     return form;
-  } catch (e1) {
-    // Newer overload: options object.
-    try {
-      form.textField(label, placeholder, { defaultValue: defaultStr });
-      return form;
-    } catch (e2) {
-      // Fallback: no default support.
-      try {
-        form.textField(label, placeholder);
-        return form;
-      } catch (e3) {
-        dbgError("ui", `Unable to attach text field: ${e1} | ${e2} | ${e3}`);
-        return form;
-      }
-    }
+  } catch (e1) {}
+
+  // Newer overload: textField(label, placeholder, { defaultValue })
+  try {
+    form.textField(label, placeholder, { defaultValue: defaultStr });
+    return form;
+  } catch (e2) {}
+
+  // Fallback: no default value support
+  try {
+    form.textField(label, placeholder);
+    return form;
+  } catch (e3) {
+    dbgError("ui", `Unable to attach text field: ${e3}`);
+    return form;
   }
 }
 
 // ModalFormData.toggle compatibility wrapper.
 function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
   const defaultBool = !!defaultValue;
-  // Legacy overload: defaultValue boolean.
+
+  // Legacy overload: toggle(label, defaultValue)
   try {
     form.toggle(label, defaultBool);
     return form;
-  } catch (e1) {
-    try {
-      const opts = { defaultValue: defaultBool };
-      const tip = String(tooltip ?? "").trim();
-      if (tip) opts.tooltip = tip;
-      form.toggle(label, opts);
-      return form;
-    } catch (e2) {
-      try {
-        form.toggle(label);
-        return form;
-      } catch (e3) {
-        dbgError("ui", `toggle attach failed: ${e1} | ${e2} | ${e3}`);
-        return form;
-      } catch (e2) {
-        try {
-          form.slider(label, min, max);
-          if (!sliderCompatLogged) {
-            const msg = "Slider overload active: slider(label, min, max)";
-            dbgInfo("ui", msg);
-            sliderCompatLogged = true;
-          }
-          return form;
-        } catch (e3) {
-          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
-          return form;
-        }
-      }
-    }
-    dbgError("ui", `slider attach failed: ${e1}`);
+  } catch (e1) {}
+
+  // Newer overload: toggle(label, { defaultValue, tooltip? })
+  try {
+    const opts = { defaultValue: defaultBool };
+    const tip = String(tooltip ?? "").trim();
+    if (tip) opts.tooltip = tip;
+    form.toggle(label, opts);
+    return form;
+  } catch (e2) {}
+
+  // Fallback: toggle(label)
+  try {
+    form.toggle(label);
+    return form;
+  } catch (e3) {
+    dbgError("ui", `toggle attach failed: ${e3}`);
     return form;
   }
 }
@@ -3745,45 +3734,42 @@ function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
 // ModalFormData.slider compatibility wrapper.
 let sliderCompatLogged = false;
 function addSliderCompat(form, label, min, max, step, defaultValue) {
+  // Preferred overload (common in modern API):
+  // slider(label, min, max, step, defaultValue)
   try {
     form.slider(label, min, max, step, defaultValue);
     if (!sliderCompatLogged) {
-      const msg = "Slider overload active: slider(label, min, max, step, defaultValue)";
-      dbgInfo("ui", msg);
+      dbgInfo("ui", "Slider overload active: slider(label, min, max, step, defaultValue)");
       sliderCompatLogged = true;
     }
     return form;
-  } catch (e1) {
-    if (String(e1).includes("Incorrect number of arguments")) {
-      try {
-        form.slider(label, min, max, defaultValue);
-        if (!sliderCompatLogged) {
-          const msg = "Slider overload active: slider(label, min, max, defaultValue)";
-          dbgInfo("ui", msg);
-          sliderCompatLogged = true;
-        }
-        return form;
-      } catch (e2) {
-        try {
-          form.slider(label, min, max);
-          if (!sliderCompatLogged) {
-            const msg = "Slider overload active: slider(label, min, max)";
-            dbgInfo("ui", msg);
-            sliderCompatLogged = true;
-          }
-          return form;
-        } catch (e3) {
-          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
-          return form;
-        }
-      }
+  } catch (e1) {}
+
+  // Older overload:
+  // slider(label, min, max, defaultValue)
+  try {
+    form.slider(label, min, max, defaultValue);
+    if (!sliderCompatLogged) {
+      dbgInfo("ui", "Slider overload active: slider(label, min, max, defaultValue)");
+      sliderCompatLogged = true;
     }
-    dbgError("ui", `slider attach failed: ${e1}`);
+    return form;
+  } catch (e2) {}
+
+  // Minimal fallback:
+  // slider(label, min, max)
+  try {
+    form.slider(label, min, max);
+    if (!sliderCompatLogged) {
+      dbgInfo("ui", "Slider overload active: slider(label, min, max)");
+      sliderCompatLogged = true;
+    }
+    return form;
+  } catch (e3) {
+    dbgError("ui", `slider attach failed: ${e3}`);
     return form;
   }
 }
-
-
 
 function openAddRestrictedItemForm(player) {
   dbgInfo("ui", "Opened Add Restricted Item Form.");
