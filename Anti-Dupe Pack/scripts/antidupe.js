@@ -3843,72 +3843,7 @@ function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
   }
 }
 
-// ModalFormData.slider compatibility wrapper.
-let sliderCompatLogged = false;
-function addSliderCompat(form, label, min, max, step, defaultValue) {
-  try {
-    form.slider(label, min, max, step, defaultValue);
-    if (!sliderCompatLogged) {
-      const msg = "Slider overload active: slider(label, min, max, step, defaultValue)";
-      dbgInfo("ui", msg);
-      sliderCompatLogged = true;
-    }
-    return form;
-  } catch (e1) {
-    if (String(e1).includes("Incorrect number of arguments")) {
-      try {
-        form.slider(label, min, max, defaultValue);
-        if (!sliderCompatLogged) {
-          const msg = "Slider overload active: slider(label, min, max, defaultValue)";
-          dbgInfo("ui", msg);
-          sliderCompatLogged = true;
-        }
-        return form;
-      } catch (e2) {
-        try {
-          form.slider(label, min, max);
-          if (!sliderCompatLogged) {
-            const msg = "Slider overload active: slider(label, min, max)";
-            dbgInfo("ui", msg);
-            sliderCompatLogged = true;
-          }
-          return form;
-        } catch (e3) {
-          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
-          return form;
-        }
-      }
-    }
-    dbgError("ui", `slider attach failed: ${e1}`);
-    return form;
-  }
-}
 
-
-  // Legacy overload: toggle(label, defaultValue)
-  try {
-    form.toggle(label, defaultBool);
-    return form;
-  } catch (e1) {}
-
-  // Newer overload: toggle(label, { defaultValue, tooltip? })
-  try {
-    const opts = { defaultValue: defaultBool };
-    const tip = String(tooltip ?? "").trim();
-    if (tip) opts.tooltip = tip;
-    form.toggle(label, opts);
-    return form;
-  } catch (e2) {}
-
-  // Fallback: toggle(label)
-  try {
-    form.toggle(label);
-    return form;
-  } catch (e3) {
-    dbgError("ui", `toggle attach failed: ${e3}`);
-    return form;
-  }
-}
 
 // ModalFormData.slider compatibility wrapper.
 let sliderCompatLogged = false;
