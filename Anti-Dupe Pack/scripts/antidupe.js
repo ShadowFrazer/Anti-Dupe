@@ -51,6 +51,11 @@ const DEFAULT_GLOBAL_CONFIG = {
   hopperPatch: true,
   dropperPatch: true,
   illegalStackPatch: true,
+  tracking: {
+    enabled: true,
+    updateIntervalSeconds: 10,
+    trackAllPlayers: false,
+  },
   restrictedItems: DEFAULT_RESTRICTED_ITEMS.slice(),
   punishments: {
     enabled: true,
@@ -92,6 +97,7 @@ const VIO_STATS_MAX_CHARS = 4000;
 const VIOLATIONS_DB_KEY = "violations_db";
 const VIOLATIONS_DB_LEGACY_KEY = "violators_db";
 const VIOLATIONS_DB_MAX_CHARS = 8000;
+const VIOLATIONS_DB_SCHEMA = 2;
 
 const DEFAULT_VIO_STATS = {
   globalCount: 0,
@@ -467,6 +473,30 @@ function normalizePunishments(input) {
   return out;
 }
 
+function normalizeTracking(input) {
+  const defaults = DEFAULT_GLOBAL_CONFIG.tracking;
+  const out = {
+    enabled: defaults.enabled,
+    updateIntervalSeconds: defaults.updateIntervalSeconds,
+    trackAllPlayers: defaults.trackAllPlayers,
+  };
+
+  if (!input || typeof input !== "object") return out;
+
+  if ("enabled" in input) out.enabled = !!input.enabled;
+  if ("updateIntervalSeconds" in input) {
+    out.updateIntervalSeconds = clampRangeInt(
+      input.updateIntervalSeconds,
+      1,
+      600,
+      defaults.updateIntervalSeconds
+    );
+  }
+  if ("trackAllPlayers" in input) out.trackAllPlayers = !!input.trackAllPlayers;
+
+  return out;
+}
+
 function rebuildRestrictedItemsSet() {
   try {
     const list = Array.isArray(globalConfig.restrictedItems)
@@ -490,6 +520,8 @@ function normalizeConfig(obj) {
     if ("hopperPatch"        in obj) cfg.hopperPatch        = !!obj.hopperPatch;
     if ("dropperPatch"       in obj) cfg.dropperPatch       = !!obj.dropperPatch;
     if ("illegalStackPatch"  in obj) cfg.illegalStackPatch  = !!obj.illegalStackPatch;
+    if ("tracking"           in obj) cfg.tracking           = normalizeTracking(obj.tracking);
+    else cfg.tracking = normalizeTracking(null);
 
     if ("restrictedItems" in obj) {
       const cleaned = sanitizeRestrictedItems(obj.restrictedItems);
@@ -505,6 +537,7 @@ function normalizeConfig(obj) {
     }
   } else {
     cfg.punishments = normalizePunishments(null);
+    cfg.tracking = normalizeTracking(null);
   }
 
   return cfg;
@@ -650,41 +683,141 @@ let vioObjectivesReady = false;
 let vioInitAttempted = false;
 
 // --- Violations Registry ---
-let violationsDb = {};
+let violationsDb = { schema: VIOLATIONS_DB_SCHEMA, profiles: {} };
 let violationsDbLoaded = false;
 let violationsDbDirty = false;
 let violationsDbSaveQueued = false;
+let violationsDbLastTrackingMs = 0;
+
+function emptyViolationsDb() {
+  return { schema: VIOLATIONS_DB_SCHEMA, profiles: {} };
+}
+
+function normalizeViolationKey(name) {
+  return String(name ?? "").trim().toLowerCase();
+}
+
+function normalizeLastKnown(input, fallbackCapturedMs = 0) {
+  if (!input || typeof input !== "object") return null;
+  const x = Number.isFinite(input.x) ? clampInt(input.x, 0) : null;
+  const y = Number.isFinite(input.y) ? clampInt(input.y, 0) : null;
+  const z = Number.isFinite(input.z) ? clampInt(input.z, 0) : null;
+  const dim = typeof input.dim === "string"
+    ? input.dim
+    : (typeof input.dimension === "string" ? input.dimension : "unknown");
+  const capturedMs = Number.isFinite(input.capturedMs) ? input.capturedMs : fallbackCapturedMs;
+  if (x === null && y === null && z === null && (!dim || dim === "unknown") && !capturedMs) return null;
+  return { x, y, z, dim: dim || "unknown", capturedMs: capturedMs || 0 };
+}
+
+function normalizeViolationProfile(raw, fallbackName) {
+  const rec = raw && typeof raw === "object" ? raw : {};
+  const nameRaw = typeof rec.name === "string" && rec.name.trim() ? rec.name : fallbackName;
+  const name = nameRaw && String(nameRaw).trim() ? String(nameRaw).trim() : "Unknown";
+  const kickLoop = rec.kickLoop && typeof rec.kickLoop === "object" ? rec.kickLoop : {};
+  const legacyKnown = rec.lastKnownLocation && typeof rec.lastKnownLocation === "object"
+    ? normalizeLastKnown(
+      {
+        x: rec.lastKnownLocation.x,
+        y: rec.lastKnownLocation.y,
+        z: rec.lastKnownLocation.z,
+        dimension: rec.lastKnownLocation.dimension,
+      },
+      Number.isFinite(rec.lastKnownAt) ? rec.lastKnownAt : 0
+    )
+    : null;
+  const lastKnown = normalizeLastKnown(rec.lastKnown, Number.isFinite(rec.lastKnownAt) ? rec.lastKnownAt : 0) || legacyKnown;
+
+  return {
+    name,
+    violations: Number.isFinite(rec.violations) ? rec.violations : 0,
+    lastViolationAt: Number.isFinite(rec.lastViolationAt) ? rec.lastViolationAt : 0,
+    reason: typeof rec.reason === "string" ? rec.reason : "",
+    kickLoop: {
+      enabled: !!kickLoop.enabled,
+      since: Number.isFinite(kickLoop.since) ? kickLoop.since : 0,
+      lastKickAt: Number.isFinite(kickLoop.lastKickAt) ? kickLoop.lastKickAt : 0,
+      intervalSec: Number.isFinite(kickLoop.intervalSec) ? kickLoop.intervalSec : 10,
+    },
+    lastSeenMs: Number.isFinite(rec.lastSeenMs) ? rec.lastSeenMs : 0,
+    lastKnown,
+    lastKnownSource: typeof rec.lastKnownSource === "string" ? rec.lastKnownSource : "",
+  };
+}
+
+function violationProfileActivityMs(profile) {
+  const lastSeen = Number.isFinite(profile?.lastSeenMs) ? profile.lastSeenMs : 0;
+  const lastViolation = Number.isFinite(profile?.lastViolationAt) ? profile.lastViolationAt : 0;
+  const lastKnown = Number.isFinite(profile?.lastKnown?.capturedMs) ? profile.lastKnown.capturedMs : 0;
+  return Math.max(lastSeen, lastViolation, lastKnown);
+}
+
+function mergeViolationProfiles(current, incoming) {
+  const a = current ?? normalizeViolationProfile({}, "");
+  const b = incoming ?? normalizeViolationProfile({}, "");
+
+  // Use the highest violation count to avoid inflating totals when deduplicating.
+  const violations = Math.max(a.violations || 0, b.violations || 0);
+
+  const aActivity = violationProfileActivityMs(a);
+  const bActivity = violationProfileActivityMs(b);
+  const name = (bActivity > aActivity ? b.name : a.name) || a.name || b.name || "Unknown";
+
+  const aLastViolation = a.lastViolationAt || 0;
+  const bLastViolation = b.lastViolationAt || 0;
+  const lastViolationAt = Math.max(aLastViolation, bLastViolation);
+  const reason = bLastViolation > aLastViolation ? b.reason : a.reason || b.reason || "";
+
+  const lastSeenMs = Math.max(a.lastSeenMs || 0, b.lastSeenMs || 0);
+
+  const aKnownCaptured = Number.isFinite(a?.lastKnown?.capturedMs) ? a.lastKnown.capturedMs : 0;
+  const bKnownCaptured = Number.isFinite(b?.lastKnown?.capturedMs) ? b.lastKnown.capturedMs : 0;
+  const lastKnown = bKnownCaptured > aKnownCaptured ? b.lastKnown : (a.lastKnown || b.lastKnown || null);
+  const lastKnownSource = bKnownCaptured > aKnownCaptured
+    ? b.lastKnownSource
+    : (a.lastKnownSource || b.lastKnownSource || "");
+
+  const aLoop = a.kickLoop ?? {};
+  const bLoop = b.kickLoop ?? {};
+  const enabled = !!aLoop.enabled || !!bLoop.enabled;
+  const sinceCandidates = [aLoop.since, bLoop.since].filter((v) => Number.isFinite(v) && v > 0);
+  const since = sinceCandidates.length ? Math.min(...sinceCandidates) : 0;
+  const lastKickAt = Math.max(aLoop.lastKickAt || 0, bLoop.lastKickAt || 0);
+  const intervalSource = bActivity >= aActivity ? bLoop.intervalSec : aLoop.intervalSec;
+  const intervalSec = clampRangeInt(intervalSource, 1, 600, 10);
+
+  return {
+    name,
+    violations,
+    lastViolationAt,
+    reason,
+    kickLoop: { enabled, since, lastKickAt, intervalSec },
+    lastSeenMs,
+    lastKnown,
+    lastKnownSource,
+  };
+}
 
 function normalizeViolationsDb(obj) {
-  if (!obj || typeof obj !== "object") return {};
-  const out = {};
-  for (const [key, raw] of Object.entries(obj)) {
-    if (!key) continue;
-    const rec = raw && typeof raw === "object" ? raw : {};
-    const kickLoop = rec.kickLoop && typeof rec.kickLoop === "object" ? rec.kickLoop : {};
-    out[key] = {
-      name: typeof rec.name === "string" ? rec.name : "Unknown",
-      violations: Number.isFinite(rec.violations) ? rec.violations : 0,
-      lastViolationAt: Number.isFinite(rec.lastViolationAt) ? rec.lastViolationAt : 0,
-      reason: typeof rec.reason === "string" ? rec.reason : "",
-      kickLoop: {
-        enabled: !!kickLoop.enabled,
-        since: Number.isFinite(kickLoop.since) ? kickLoop.since : 0,
-        lastKickAt: Number.isFinite(kickLoop.lastKickAt) ? kickLoop.lastKickAt : 0,
-        intervalSec: Number.isFinite(kickLoop.intervalSec) ? kickLoop.intervalSec : 10,
-      },
-      lastKnownLocation: rec.lastKnownLocation && typeof rec.lastKnownLocation === "object"
-        ? {
-          x: Number.isFinite(rec.lastKnownLocation.x) ? rec.lastKnownLocation.x : null,
-          y: Number.isFinite(rec.lastKnownLocation.y) ? rec.lastKnownLocation.y : null,
-          z: Number.isFinite(rec.lastKnownLocation.z) ? rec.lastKnownLocation.z : null,
-          dimension: typeof rec.lastKnownLocation.dimension === "string" ? rec.lastKnownLocation.dimension : "unknown",
-        }
-        : null,
-      lastKnownAt: Number.isFinite(rec.lastKnownAt) ? rec.lastKnownAt : 0,
-      lastKnownSource: typeof rec.lastKnownSource === "string" ? rec.lastKnownSource : "",
-    };
+  const out = emptyViolationsDb();
+  if (!obj || typeof obj !== "object") return out;
+
+  const rawProfiles = obj.profiles && typeof obj.profiles === "object" ? obj.profiles : obj;
+  let unnamedIndex = 0;
+
+  for (const [rawKey, raw] of Object.entries(rawProfiles)) {
+    const fallbackName = typeof rawKey === "string" && rawKey ? rawKey : `Unknown-${unnamedIndex++}`;
+    const profile = normalizeViolationProfile(raw, fallbackName);
+    const normalizedKey = normalizeViolationKey(profile.name || fallbackName) || normalizeViolationKey(fallbackName);
+    if (!normalizedKey) continue;
+
+    if (out.profiles[normalizedKey]) {
+      out.profiles[normalizedKey] = mergeViolationProfiles(out.profiles[normalizedKey], profile);
+    } else {
+      out.profiles[normalizedKey] = profile;
+    }
   }
+
   return out;
 }
 
@@ -693,7 +826,7 @@ function loadViolationsDb() {
   violationsDbLoaded = true;
 
   if (!persistenceEnabled) {
-    violationsDb = {};
+    violationsDb = emptyViolationsDb();
     dbgWarn("violations", "Dynamic properties unavailable; violations registry will not persist.");
     return;
   }
@@ -701,7 +834,12 @@ function loadViolationsDb() {
   try {
     const raw = world.getDynamicProperty(VIOLATIONS_DB_KEY);
     if (typeof raw === "string" && raw.length > 0) {
-      violationsDb = normalizeViolationsDb(JSON.parse(raw));
+      const parsed = JSON.parse(raw);
+      violationsDb = normalizeViolationsDb(parsed);
+      if (!parsed?.schema || !parsed?.profiles || violationsDb.schema !== VIOLATIONS_DB_SCHEMA) {
+        violationsDb.schema = VIOLATIONS_DB_SCHEMA;
+        violationsDbDirty = true;
+      }
       dbgInfo("violations", "Loaded violations registry.");
       return;
     }
@@ -715,11 +853,11 @@ function loadViolationsDb() {
       return;
     }
 
-    violationsDb = {};
+    violationsDb = emptyViolationsDb();
     dbgInfo("violations", "No saved violations registry found; starting empty.");
   } catch (e) {
     dbgError("violations", `Unable to load violations registry; reset to empty: ${e}`);
-    violationsDb = {};
+    violationsDb = emptyViolationsDb();
   }
 }
 
@@ -728,7 +866,7 @@ function saveViolationsDbNow() {
   if (!violationsDbDirty) return;
 
   try {
-    const raw = safeStringifyWithCap(violationsDb, VIOLATIONS_DB_MAX_CHARS, {});
+    const raw = safeStringifyWithCap(violationsDb, VIOLATIONS_DB_MAX_CHARS, emptyViolationsDb());
     world.setDynamicProperty(VIOLATIONS_DB_KEY, raw);
     violationsDbDirty = false;
     dbgInfo("violations", "Violations registry saved.");
@@ -760,27 +898,61 @@ try {
 
 system.runInterval(() => {
   try {
+    if (!configLoaded) loadGlobalConfig();
+    const tracking = globalConfig.tracking ?? DEFAULT_GLOBAL_CONFIG.tracking;
+    if (!tracking?.enabled) return;
+    const intervalSec = clampRangeInt(tracking.updateIntervalSeconds, 1, 600, 10);
+    const now = Date.now();
+    if (now - violationsDbLastTrackingMs < intervalSec * 1000) return;
+    violationsDbLastTrackingMs = now;
+
     if (!violationsDbLoaded) loadViolationsDb();
+    const profiles = violationsDb.profiles ?? {};
+    let updated = false;
+
     for (const p of getPlayersSafe()) {
-      const key = violationKeyForPlayer(p);
+      const name = scoreKeyForPlayer(p);
+      const key = normalizeViolationKey(name);
       if (!key) continue;
-      const entry = violationsDb[key];
-      if (!entry) continue;
-      const pos = p.location ?? null;
-      if (!pos) continue;
+
+      let entry = profiles[key];
+      if (!entry && !tracking.trackAllPlayers) continue;
+
+      if (!entry) {
+        entry = normalizeViolationProfile({}, name);
+        profiles[key] = entry;
+        updated = true;
+      }
+
+      const lastKnown = buildLastKnownFromPlayer(p, now);
+      const shouldUpdateKnown = lastKnown && (!entry.lastKnown || lastKnown.capturedMs >= (entry.lastKnown.capturedMs || 0));
+
+      const nextEntry = {
+        ...entry,
+        name,
+        lastSeenMs: now,
+        lastKnown: shouldUpdateKnown ? lastKnown : entry.lastKnown,
+        lastKnownSource: shouldUpdateKnown ? "tracking" : entry.lastKnownSource,
+      };
+
+      profiles[key] = nextEntry;
+      updated = true;
+
       lastSeenViolationsLocation.set(key, {
-        x: pos.x,
-        y: pos.y,
-        z: pos.z,
-        dimension: safeDimIdFromEntity(p),
-        at: Date.now(),
-        name: scoreKeyForPlayer(p),
+        lastKnown: nextEntry.lastKnown,
+        name,
+        lastSeenMs: now,
       });
+    }
+
+    if (updated) {
+      violationsDb.profiles = profiles;
+      queueSaveViolationsDb();
     }
   } catch (e) {
     dbgWarn("violations", `Last-seen location cache failed: ${e}`);
   }
-}, 40);
+}, 20);
 
 function normalizeVioStats(obj) {
   const out = JSON.parse(JSON.stringify(DEFAULT_VIO_STATS));
@@ -955,12 +1127,8 @@ function scoreKeyForPlayer(player) {
 }
 
 function violationKeyForPlayer(player) {
-  const id = player?.id ?? player?.xuid ?? player?.uuid;
-  if (id !== undefined && id !== null) {
-    const key = String(id).trim();
-    if (key) return key;
-  }
-  return scoreKeyForPlayer(player);
+  const name = scoreKeyForPlayer(player);
+  return normalizeViolationKey(name);
 }
 
 function isBadOfflineScoreboardName(name) {
@@ -981,24 +1149,40 @@ function formatAgo(ms) {
   return `${day}d ago`;
 }
 
+function buildLastKnownFromPlayer(player, capturedMs = Date.now()) {
+  if (!player) return null;
+  const pos = player.location ?? null;
+  if (!pos) return null;
+  const x = Number.isFinite(pos.x) ? clampInt(pos.x, 0) : null;
+  const y = Number.isFinite(pos.y) ? clampInt(pos.y, 0) : null;
+  const z = Number.isFinite(pos.z) ? clampInt(pos.z, 0) : null;
+  const dimId = safeDimIdFromEntity(player);
+  if (x === null && y === null && z === null && (!dimId || dimId === "unknown")) return null;
+  return {
+    x,
+    y,
+    z,
+    dim: dimId || "unknown",
+    capturedMs: Number.isFinite(capturedMs) ? capturedMs : Date.now(),
+  };
+}
+
 function captureViolationLocation(player, source) {
   try {
     if (!player) return;
     if (!violationsDbLoaded) loadViolationsDb();
     const key = violationKeyForPlayer(player);
     if (!key) return;
-    const entry = violationsDb[key];
+    const entry = violationsDb.profiles?.[key];
     if (!entry) return;
-    const pos = player.location ?? null;
-    const x = pos && Number.isFinite(pos.x) ? clampInt(pos.x, 0) : null;
-    const y = pos && Number.isFinite(pos.y) ? clampInt(pos.y, 0) : null;
-    const z = pos && Number.isFinite(pos.z) ? clampInt(pos.z, 0) : null;
-    const dimId = safeDimIdFromEntity(player);
-    violationsDb[key] = {
+    const now = Date.now();
+    const lastKnown = buildLastKnownFromPlayer(player, now);
+    if (!lastKnown) return;
+    violationsDb.profiles[key] = {
       ...entry,
       name: scoreKeyForPlayer(player),
-      lastKnownLocation: { x, y, z, dimension: dimId || "unknown" },
-      lastKnownAt: Date.now(),
+      lastSeenMs: now,
+      lastKnown,
       lastKnownSource: source,
     };
     queueSaveViolationsDb();
@@ -1240,14 +1424,19 @@ function updateViolationRecordFromViolation(player, total, incidentType) {
   if (!key) return;
   const name = scoreKeyForPlayer(player);
   const now = Date.now();
-  const existing = violationsDb[key] ?? {};
+  const profiles = violationsDb.profiles ?? (violationsDb.profiles = {});
+  const existing = profiles[key] ?? normalizeViolationProfile({}, name);
   const violations = Number.isFinite(total) ? total : (existing.violations ?? 0);
-  violationsDb[key] = {
+  const lastKnown = buildLastKnownFromPlayer(player, now);
+  profiles[key] = {
     ...existing,
     name,
     violations,
     lastViolationAt: now,
     reason: String(incidentType ?? ""),
+    lastSeenMs: now,
+    lastKnown: lastKnown ?? existing.lastKnown ?? null,
+    lastKnownSource: lastKnown ? "violation" : existing.lastKnownSource,
     kickLoop: {
       enabled: !!existing?.kickLoop?.enabled,
       since: Number.isFinite(existing?.kickLoop?.since) ? existing.kickLoop.since : 0,
@@ -1264,26 +1453,29 @@ function updateViolationNameForPlayer(player) {
   const key = violationKeyForPlayer(player);
   if (!key) return;
   const name = scoreKeyForPlayer(player);
-  const existing = violationsDb[key];
+  const existing = violationsDb.profiles?.[key];
   if (!existing) return;
   if (existing.name !== name) {
-    violationsDb[key] = { ...existing, name };
+    violationsDb.profiles[key] = { ...existing, name };
     queueSaveViolationsDb();
   }
 }
 
 function isKickLoopedByKey(key) {
   if (!violationsDbLoaded) loadViolationsDb();
-  const entry = violationsDb[key];
+  const normalized = normalizeViolationKey(key);
+  const entry = violationsDb.profiles?.[normalized];
   return !!entry?.kickLoop?.enabled;
 }
 
 function setKickLoopForKey(key, enabled) {
   if (!violationsDbLoaded) loadViolationsDb();
-  const entry = violationsDb[key] ?? { name: "Unknown", violations: 0, lastViolationAt: 0, reason: "" };
+  const normalized = normalizeViolationKey(key);
+  if (!normalized) return;
+  const entry = violationsDb.profiles?.[normalized] ?? normalizeViolationProfile({}, "Unknown");
   const now = Date.now();
   const kickLoop = entry.kickLoop && typeof entry.kickLoop === "object" ? entry.kickLoop : {};
-  violationsDb[key] = {
+  violationsDb.profiles[normalized] = {
     ...entry,
     kickLoop: {
       enabled: !!enabled,
@@ -1411,6 +1603,286 @@ async function applyPunishment(player, incidentType, itemDesc, loc, vio) {
         mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${typeTag})`);
       }
     }
+
+    if (effectiveTag && thresholdEnabled && typeScore >= threshold && !player.hasTag?.(effectiveTag)) {
+      player.addTag?.(effectiveTag);
+      mitigationNote = appendMitigation(mitigationNote, `Punishment: Tag Added (${effectiveTag})`);
+    }
+
+    if (thresholdEnabled && typeScore >= threshold) {
+      if (!punish.allowKick) {
+        dbgInfo("punish", `Kick gated for ${name}: global kicks disabled.`);
+      } else if (!typeSettings.kickAtThreshold) {
+        dbgInfo("punish", `Kick gated for ${name}: kick at threshold disabled for ${typeLabel}.`);
+      } else {
+        const now = system.currentTick;
+        const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+        const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 20);
+        if (now - last < cooldown) {
+          dbgInfo("punish", `Kick gated for ${name}: cooldown active (${cooldown} ticks).`);
+        } else {
+          const reason = renderPunishmentReason(punish.reasonTemplate, typeLabel, typeScore, threshold);
+          const kicked = await tryKickPlayer(player, reason);
+          lastPunishTickByPlayerName.set(name, now);
+          if (kicked) {
+            mitigationNote = appendMitigation(mitigationNote, `Punishment: Kicked at Threshold (${typeScore}/${threshold})`);
+            const dimId = safeDimIdFromEntity(player);
+            const dimLabel = prettyDimension(dimId);
+            const pos = player.location ?? loc;
+            const coordStr = pos ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}` : "Unknown";
+            const tagNote = effectiveTag ? ` Tag: ${effectiveTag}.` : "";
+            sendAdminAlert(`§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked for §f${typeLabel}§r §7violations (${typeScore}/${threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r${tagNote}`);
+            if (punish.publicKickMessage) {
+              for (const p of getPlayersSafe()) {
+                if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+                  try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for repeated §f${typeLabel}§r §7violations.`); } catch {}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return mitigationNote;
+  } catch (e) {
+    dbgWarn("punish", `applyPunishment error: ${e}`);
+    return "";
+  }
+}
+
+function evaluateKickEligibilityForPlayer(player) {
+  if (!player) return null;
+  const name = scoreKeyForPlayer(player);
+  if (!name) return null;
+  if (player.hasTag?.(ADMIN_TAG)) return null;
+
+  if (!configLoaded) loadGlobalConfig();
+  const punish = globalConfig.punishments;
+  if (!punish?.enabled) return null;
+
+  const bypassTag = String(punish.bypassTag ?? "").trim();
+  if (bypassTag && player.hasTag?.(bypassTag)) {
+    dbgInfo("punish", `Join kick gated for ${name}: bypass tag present (${bypassTag}).`);
+    return null;
+  }
+
+  if (!ensureViolationObjectives()) return null;
+  migrateViolationScoresForPlayer(player);
+
+  const sb = world.scoreboard;
+  if (!sb) return null;
+
+  const keys = ["ghost", "plant", "hopper", "dropper", "illegal", "other"];
+  let best = null;
+  let sawOverThreshold = false;
+
+  for (const key of keys) {
+    const typeSettings = punish.types?.[key];
+    if (!typeSettings?.enabled) continue;
+    const threshold = clampRangeInt(typeSettings.threshold, 0, 200, 0);
+    if (threshold <= 0) continue;
+    const obj = sb.getObjective(objectiveIdForKey(key));
+    if (!obj) continue;
+    const typeScore = tryGetScoreByEntityOrName(obj, player, name);
+    if (typeScore >= threshold) {
+      sawOverThreshold = true;
+      if (!typeSettings.kickAtThreshold) {
+        dbgInfo("punish", `Join kick gated for ${name}: kick at threshold disabled for ${prettyTypeKey(key)}.`);
+        continue;
+      }
+      if (!punish.allowKick) continue;
+      const ratio = threshold > 0 ? typeScore / threshold : typeScore;
+      if (!best || ratio > best.ratio || (ratio === best.ratio && typeScore > best.typeScore)) {
+        best = { key, typeScore, threshold, ratio };
+      }
+    }
+  }
+
+  if (sawOverThreshold && !punish.allowKick) {
+    dbgInfo("punish", `Join kick gated for ${name}: global kicks disabled.`);
+  }
+
+  if (!best || !punish.allowKick) return null;
+
+  const now = system.currentTick;
+  const last = lastPunishTickByPlayerName.get(name) ?? -999999;
+  const cooldown = clampRangeInt(punish.cooldownTicks, 0, 200, 20);
+  if (now - last < cooldown) {
+    dbgInfo("punish", `Join kick gated for ${name}: cooldown active (${cooldown} ticks).`);
+    return null;
+  }
+
+  const typeLabel = prettyTypeKey(best.key);
+  const reason = renderPunishmentReason(
+    punish.reasonTemplate,
+    typeLabel,
+    best.typeScore,
+    best.threshold
+  );
+
+  return { key: best.key, typeScore: best.typeScore, threshold: best.threshold, typeLabel, reason };
+}
+
+async function kickPlayerForExistingViolations(player, details) {
+  if (!player || !details) return false;
+  const name = String(player?.name ?? "").trim();
+  if (!name) return false;
+  const now = system.currentTick;
+  captureViolationLocation(player, "kick");
+  const kicked = await tryKickPlayer(player, details.reason);
+  lastPunishTickByPlayerName.set(name, now);
+  if (!kicked) return false;
+
+  const pos = player.location ?? {};
+  const coordStr = (Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.z))
+    ? `${clampInt(pos.x)}, ${clampInt(pos.y)}, ${clampInt(pos.z)}`
+    : "Unknown";
+  const dimId = safeDimIdFromEntity(player);
+  const dimLabel = prettyDimension(dimId);
+
+  sendAdminAlert(
+    `§c<Anti-Dupe>§r §6Punishment:§r ${name} §7was kicked on join for existing §f${details.typeLabel}§r ` +
+    `§7violations (${details.typeScore}/${details.threshold}) at §e§l${dimLabel}§r §7(§e${coordStr}§7).§r`
+  );
+
+  const punish = globalConfig.punishments;
+  if (punish.publicKickMessage) {
+    for (const p of getPlayersSafe()) {
+      if (!p?.hasTag?.(DISABLE_PUBLIC_MSG_TAG)) {
+        try { p.sendMessage(`§c<Anti-Dupe>§r §f${name}§r §7was removed for §f${details.typeLabel}§r §7violations.`); } catch {}
+      }
+    }
+  }
+  return true;
+}
+
+async function enforceKickLoopOnJoin(player) {
+  if (!player) return false;
+  if (player.hasTag?.(ADMIN_TAG)) return false;
+  if (!configLoaded) loadGlobalConfig();
+  const bypassTag = String(globalConfig.punishments?.bypassTag ?? "").trim();
+  if (bypassTag && player.hasTag?.(bypassTag)) return false;
+  if (!violationsDbLoaded) loadViolationsDb();
+  const key = violationKeyForPlayer(player);
+  if (!key) return false;
+  const entry = violationsDb.profiles?.[key];
+  if (!entry?.kickLoop?.enabled) return false;
+  const now = Date.now();
+  const intervalSec = Number.isFinite(entry.kickLoop.intervalSec) ? entry.kickLoop.intervalSec : 10;
+  const minMs = Math.max(1, intervalSec) * 1000;
+  const lastKickAt = Number.isFinite(entry.kickLoop.lastKickAt) ? entry.kickLoop.lastKickAt : 0;
+  if (lastKickAt && now - lastKickAt < minMs) return false;
+
+  const name = scoreKeyForPlayer(player);
+  const reason = renderPunishmentReason(
+    globalConfig.punishments?.reasonTemplate,
+    "Kick Loop",
+    entry.violations ?? 0,
+    0
+  );
+  captureViolationLocation(player, "kick");
+  const kicked = await tryKickPlayer(player, reason);
+  if (kicked) {
+    violationsDb.profiles[key] = {
+      ...entry,
+      name,
+      kickLoop: {
+        ...entry.kickLoop,
+        lastKickAt: now,
+      },
+    };
+    queueSaveViolationsDb();
+  }
+  return kicked;
+}
+
+function getViolationsTable() {
+  try {
+    const sb = world.scoreboard;
+    if (!sb) return { rows: [], note: "Scoreboard unavailable." };
+
+    const totalObj = sb.getObjective(VIO_OBJ_TOTAL);
+    if (!totalObj) return { rows: [], note: "Violation objectives are not initialized yet." };
+
+    let scores = [];
+    try {
+      scores = totalObj.getScores?.() ?? [];
+    } catch (e) {
+      return { rows: [], note: `Could not read scores: ${e}` };
+    }
+
+    const rows = [];
+    let hiddenLegacy = 0;
+    for (const info of scores) {
+      const participant = info?.participant;
+      const total = info?.score ?? 0;
+      if (!participant || total <= 0) continue;
+
+      const pname = participant.displayName ?? "Unknown";
+      if (pname === GLOBAL_PARTICIPANT) continue;
+      if (isBadOfflineScoreboardName(pname)) {
+        hiddenLegacy++;
+        continue;
+      }
+
+      const ghostObj = sb.getObjective(VIO_OBJ_GHOST);
+      const plantObj = sb.getObjective(VIO_OBJ_PLANT);
+      const hopObj   = sb.getObjective(VIO_OBJ_HOPPER);
+      const dropObj  = sb.getObjective(VIO_OBJ_DROPPER);
+      const illegalObj = sb.getObjective(VIO_OBJ_ILLEGAL);
+      const otherObj = sb.getObjective(VIO_OBJ_OTHER);
+
+      const ghost = tryGetScoreByEntityOrName(ghostObj, participant, pname);
+      const plant = tryGetScoreByEntityOrName(plantObj, participant, pname);
+      const hopper = tryGetScoreByEntityOrName(hopObj, participant, pname);
+      const dropper = tryGetScoreByEntityOrName(dropObj, participant, pname);
+      const illegal = tryGetScoreByEntityOrName(illegalObj, participant, pname);
+      const other = tryGetScoreByEntityOrName(otherObj, participant, pname);
+
+      rows.push({ name: pname, total, ghost, plant, hopper, dropper, illegal, other });
+    }
+
+    rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
+    const note = hiddenLegacy > 0 ? `Hidden legacy offline entries: ${hiddenLegacy}` : "";
+    return { rows, note };
+  } catch (e) {
+    return { rows: [], note: `Violations table error: ${e}` };
+  }
+}
+
+function getMostUsedViolationType() {
+  const tc = vioStats?.typeCounts;
+  if (!tc || typeof tc !== "object") return { key: "None", count: 0 };
+
+  let bestKey = "None";
+  let best = 0;
+
+  for (const k of ["ghost", "plant", "hopper", "dropper", "illegal", "other"]) {
+    const v = Number.isFinite(tc[k]) ? tc[k] : 0;
+    if (v > best) {
+      best = v;
+      bestKey = k;
+    }
+
+function prettyTypeKey(k) {
+  switch (k) {
+    case "ghost": return "Ghost Stack";
+    case "plant": return "Piston";
+    case "hopper": return "Hopper";
+    case "dropper": return "Dropper";
+    case "illegal": return "Illegal Stack";
+    case "other": return "Other";
+    default: return String(k ?? "Unknown");
+  }
+}
+
+// --- Incident Logs ---
+// Stored keys are compact to fit dynamic property limits.
+let dupeLogs = [];
+let logsLoaded = false;
+let logsDirty = false;
+let saveQueued = false;
 
     if (effectiveTag && thresholdEnabled && typeScore >= threshold && !player.hasTag?.(effectiveTag)) {
       player.addTag?.(effectiveTag);
@@ -2077,22 +2549,18 @@ try {
       const name = String(event?.playerName ?? "").trim();
       if (!name) return;
       if (!violationsDbLoaded) loadViolationsDb();
-      for (const [key, entry] of Object.entries(violationsDb)) {
-        if (!entry || entry.name !== name) continue;
-        const lastSeen = lastSeenViolationsLocation.get(key);
-        if (!lastSeen) continue;
-        violationsDb[key] = {
-          ...entry,
-          lastKnownLocation: {
-            x: Number.isFinite(lastSeen.x) ? clampInt(lastSeen.x, 0) : null,
-            y: Number.isFinite(lastSeen.y) ? clampInt(lastSeen.y, 0) : null,
-            z: Number.isFinite(lastSeen.z) ? clampInt(lastSeen.z, 0) : null,
-            dimension: lastSeen.dimension ?? "unknown",
-          },
-          lastKnownAt: lastSeen.at ?? Date.now(),
-          lastKnownSource: "logout",
-        };
-      }
+      const key = normalizeViolationKey(name);
+      const entry = violationsDb.profiles?.[key];
+      if (!entry) return;
+      const cached = lastSeenViolationsLocation.get(key);
+      const lastKnown = cached?.lastKnown ?? entry.lastKnown ?? null;
+      violationsDb.profiles[key] = {
+        ...entry,
+        name,
+        lastSeenMs: Date.now(),
+        lastKnown,
+        lastKnownSource: lastKnown ? "logout" : entry.lastKnownSource,
+      };
       queueSaveViolationsDb();
     } catch (e) {
       dbgWarn("violations", `Player leave location capture failed: ${e}`);
@@ -3050,8 +3518,9 @@ function buildViolationEntries(filter = "all") {
   if (!violationsDbLoaded) loadViolationsDb();
   ensureViolationObjectives();
   const entries = new Map();
+  const profiles = violationsDb.profiles ?? {};
 
-  for (const [key, rec] of Object.entries(violationsDb)) {
+  for (const [key, rec] of Object.entries(profiles)) {
     if (!key) continue;
     const kickLoopEnabled = !!rec?.kickLoop?.enabled;
     if (filter === "kickLoopOnly" && !kickLoopEnabled) continue;
@@ -3062,8 +3531,8 @@ function buildViolationEntries(filter = "all") {
       lastViolationAt: Number.isFinite(rec?.lastViolationAt) ? rec.lastViolationAt : 0,
       reason: rec?.reason ?? "",
       kickLoop: rec?.kickLoop ?? { enabled: false },
-      lastKnownLocation: rec?.lastKnownLocation ?? null,
-      lastKnownAt: Number.isFinite(rec?.lastKnownAt) ? rec.lastKnownAt : 0,
+      lastSeenMs: Number.isFinite(rec?.lastSeenMs) ? rec.lastSeenMs : 0,
+      lastKnown: rec?.lastKnown ?? null,
       lastKnownSource: rec?.lastKnownSource ?? "",
     });
   }
@@ -3072,6 +3541,7 @@ function buildViolationEntries(filter = "all") {
     const sb = world.scoreboard;
     const totalObj = sb?.getObjective?.(VIO_OBJ_TOTAL);
     const scores = totalObj?.getScores?.() ?? [];
+    let didUpdate = false;
     for (const s of scores) {
       const participant = s?.participant;
       const name = participant?.displayName ?? "";
@@ -3079,20 +3549,38 @@ function buildViolationEntries(filter = "all") {
       if (isBadOfflineScoreboardName(name)) continue;
       const total = s?.score ?? 0;
       if (total <= 0) continue;
-      if (!entries.has(name)) {
+      const key = normalizeViolationKey(name);
+      if (!key) continue;
+      if (!entries.has(key)) {
         if (filter === "kickLoopOnly") continue;
-        entries.set(name, {
-          key: name,
+        const profile = normalizeViolationProfile({}, name);
+        profile.violations = total;
+        profiles[key] = profile;
+        entries.set(key, {
+          key,
           name,
           violations: total,
           lastViolationAt: 0,
           reason: "",
           kickLoop: { enabled: false },
+          lastSeenMs: 0,
+          lastKnown: null,
+          lastKnownSource: "",
         });
+        didUpdate = true;
       } else {
-        const current = entries.get(name);
-        if (current && total > current.violations) current.violations = total;
+        const current = entries.get(key);
+        if (current && total > current.violations) {
+          current.violations = total;
+          const existing = profiles[key] ?? normalizeViolationProfile({}, name);
+          profiles[key] = { ...existing, name, violations: total };
+          didUpdate = true;
+        }
       }
+    }
+    if (didUpdate) {
+      violationsDb.profiles = profiles;
+      queueSaveViolationsDb();
     }
   } catch (e) {
     dbgWarn("violators", `Unable to read violator scores: ${e}`);
@@ -3100,11 +3588,10 @@ function buildViolationEntries(filter = "all") {
 
   const list = Array.from(entries.values());
   list.sort((a, b) => {
-    const aLoop = a.kickLoop?.enabled ? 1 : 0;
-    const bLoop = b.kickLoop?.enabled ? 1 : 0;
-    if (aLoop !== bLoop) return bLoop - aLoop;
-    if (b.violations !== a.violations) return b.violations - a.violations;
-    return (b.lastViolationAt || 0) - (a.lastViolationAt || 0);
+    const aSeen = a.lastSeenMs || 0;
+    const bSeen = b.lastSeenMs || 0;
+    if (bSeen !== aSeen) return bSeen - aSeen;
+    return (a.name || "").localeCompare(b.name || "");
   });
 
   return list;
@@ -3154,6 +3641,7 @@ function openViolationsMenu(player) {
 function openViolationList(player, filter = "all", pageIndex = 0) {
   try {
     dbgInfo("ui", `Opened Violations List (${filter}) page ${pageIndex}.`);
+    if (!configLoaded) loadGlobalConfig();
     const pageSize = 12;
     const entries = buildViolationEntries(filter);
     if (!entries.length) {
@@ -3177,20 +3665,30 @@ function openViolationList(player, filter = "all", pageIndex = 0) {
 
     const start = pageIndex * pageSize;
     const page = entries.slice(start, start + pageSize);
+    const tracking = globalConfig.tracking ?? DEFAULT_GLOBAL_CONFIG.tracking;
+    const intervalSec = clampRangeInt(tracking.updateIntervalSeconds, 1, 600, 10);
+    const trackingLabel = tracking.enabled ? `${intervalSec}s` : "Off";
 
     const form = new ActionFormData()
       .title("Violations")
-      .body(`Showing ${start + 1}-${Math.min(start + page.length, entries.length)} of ${entries.length}`);
+      .body(
+        [
+          `Showing ${start + 1}-${Math.min(start + page.length, entries.length)} of ${entries.length}`,
+          `Entries: ${entries.length}`,
+          `Tracking interval: ${trackingLabel}`,
+        ].join("\n")
+      );
 
     for (const entry of page) {
-      const loopStatus = entry.kickLoop?.enabled ? "ON" : "OFF";
-      const last = entry.lastViolationAt ? formatAgo(entry.lastViolationAt) : "Unknown";
-      form.button(`${entry.name} | v:${entry.violations} | Kick Loop:${loopStatus} | Last:${last}`);
+      const lastSeen = entry.lastSeenMs ? formatAgo(entry.lastSeenMs) : "Unknown";
+      form.button(`§f${entry.name}\n§7Last seen: ${lastSeen}`);
     }
 
     if (pageIndex > 0) form.button("← Prev Page");
     if (start + page.length < entries.length) form.button("Next Page →");
     form.button("Back");
+    const canClearAll = player?.hasTag?.(ADMIN_TAG);
+    if (canClearAll) form.button("Clear All Violations");
 
     ForceOpen(player, form).then((res) => {
       if (!res) {
@@ -3213,6 +3711,11 @@ function openViolationList(player, filter = "all", pageIndex = 0) {
       if (start + page.length < entries.length) {
         if (selection === index) return openNextTick(() => openViolationList(player, filter, pageIndex + 1));
         index += 1;
+      }
+      if (selection === index) return openNextTick(() => openViolationsMenu(player));
+      index += 1;
+      if (canClearAll && selection === index) {
+        return openNextTick(() => confirmClearAllViolations(player, filter, pageIndex));
       }
       openNextTick(() => openViolationsMenu(player));
     }).catch((e) => {
@@ -3238,15 +3741,16 @@ function openViolationDetail(player, entry, filter = "all", pageIndex = 0) {
     const lastViolationAt = entry?.lastViolationAt ?? 0;
     const reason = entry?.reason ?? "";
     const kickLoop = entry?.kickLoop ?? {};
-    const lastKnown = entry?.lastKnownLocation ?? null;
-    const lastKnownAt = entry?.lastKnownAt ?? 0;
-    const lastKnownSource = entry?.lastKnownSource ?? "";
+    const lastSeenMs = entry?.lastSeenMs ?? 0;
+    const lastKnown = entry?.lastKnown ?? null;
+    const lastKnownCaptured = Number.isFinite(lastKnown?.capturedMs) ? lastKnown.capturedMs : 0;
 
     const body = [
       `ID: ${key || "Unknown"}`,
       `Name: ${name}`,
       `Violations: ${violations}`,
       `Last Violation: ${lastViolationAt ? formatAgo(lastViolationAt) : "Unknown"}`,
+      `Last Seen: ${lastSeenMs ? formatAgo(lastSeenMs) : "Unknown"}`,
       reason ? `Reason: ${reason}` : "",
       "",
       `Kick Loop: ${kickLoop.enabled ? "ON" : "OFF"}`,
@@ -3256,8 +3760,8 @@ function openViolationDetail(player, entry, filter = "all", pageIndex = 0) {
       "",
       "Last Known Location:",
       lastKnown ? `- Coordinates: ${lastKnown.x ?? "?"}, ${lastKnown.y ?? "?"}, ${lastKnown.z ?? "?"}` : "- Coordinates: Unknown",
-      lastKnown ? `- Dimension: ${lastKnown.dimension ?? "Unknown"}` : "- Dimension: Unknown",
-      lastKnownAt ? `- Captured: ${formatAgo(lastKnownAt)} (${lastKnownSource || "unknown"})` : "- Captured: Unknown",
+      lastKnown ? `- Dimension: ${prettyDimension(lastKnown.dim ?? "unknown")}` : "- Dimension: Unknown",
+      lastKnownCaptured ? `- Captured: ${formatAgo(lastKnownCaptured)}` : "- Captured: Unknown",
     ].filter(Boolean).join("\n");
 
     const toggleLabel = kickLoop.enabled ? "Toggle Kick Loop (Off)" : "Toggle Kick Loop (On)";
@@ -3294,6 +3798,73 @@ function openViolationDetail(player, entry, filter = "all", pageIndex = 0) {
   }
 }
 
+function resetAllViolationScoreboards() {
+  try {
+    if (!ensureViolationObjectives()) return;
+    const sb = world.scoreboard;
+    if (!sb) return;
+    const objectives = [
+      VIO_OBJ_TOTAL,
+      VIO_OBJ_GHOST,
+      VIO_OBJ_PLANT,
+      VIO_OBJ_HOPPER,
+      VIO_OBJ_DROPPER,
+      VIO_OBJ_ILLEGAL,
+      VIO_OBJ_OTHER,
+      VIO_OBJ_GLOBAL,
+    ];
+
+    for (const objId of objectives) {
+      const obj = sb.getObjective(objId);
+      if (!obj) continue;
+      const scores = obj.getScores?.() ?? [];
+      for (const s of scores) {
+        const participant = s?.participant;
+        if (!participant) continue;
+        try {
+          if (typeof obj.removeParticipant === "function") {
+            obj.removeParticipant(participant);
+          } else if (typeof obj.setScore === "function") {
+            obj.setScore(participant, 0);
+          }
+        } catch {}
+      }
+      try {
+        if (typeof obj.setScore === "function") obj.setScore(GLOBAL_PARTICIPANT, 0);
+      } catch {}
+    }
+  } catch (e) {
+    dbgWarn("violations", `Reset violation scoreboards failed: ${e}`);
+  }
+}
+
+function confirmClearAllViolations(player, filter, pageIndex) {
+  const form = new MessageFormData()
+    .title("Clear All Violations")
+    .body("This will remove ALL violation profiles from the registry. This cannot be undone.")
+    .button1("Cancel")
+    .button2("Clear");
+
+  ForceOpen(player, form).then((res) => {
+    if (!res) {
+      notifyFormFailed(player, "Clear All Violations");
+      return openNextTick(() => openViolationList(player, filter, pageIndex));
+    }
+    if (res.canceled || res.selection === 0) return openNextTick(() => openViolationList(player, filter, pageIndex));
+    if (!violationsDbLoaded) loadViolationsDb();
+    violationsDb = emptyViolationsDb();
+    queueSaveViolationsDb();
+    resetAllViolationScoreboards();
+    try { player.sendMessage("§aAll violation profiles cleared."); } catch {}
+    openNextTick(() => openViolationList(player, filter, 0));
+  }).catch((e) => {
+    dbgError("ui", `Clear all violations confirm failed: ${e}`);
+    logConsoleWarn(`[Anti-Dupe] Clear all violations confirm failed: ${e}`);
+    notifyFormFailed(player, "Clear All Violations");
+    openNextTick(() => openViolationList(player, filter, pageIndex));
+  });
+}
+
 function toggleViolationKickLoop(player, entry, filter, pageIndex) {
   const key = entry?.key ?? "";
   if (!key) return openNextTick(() => openViolationList(player, filter, pageIndex));
@@ -3321,13 +3892,13 @@ function confirmViolationReset(player, entry, filter, pageIndex) {
     resetViolationScoresByName(nameKey, "all", true);
     if (!violationsDbLoaded) loadViolationsDb();
     const key = entry?.key ?? "";
-    const existing = violationsDb[key];
+    const existing = violationsDb.profiles?.[key];
     if (existing) {
       const kickLoopEnabled = !!existing?.kickLoop?.enabled;
       if (kickLoopEnabled) {
-        violationsDb[key] = { ...existing, violations: 0, lastViolationAt: 0, reason: "" };
+        violationsDb.profiles[key] = { ...existing, violations: 0, lastViolationAt: 0, reason: "" };
       } else {
-        delete violationsDb[key];
+        delete violationsDb.profiles[key];
       }
       queueSaveViolationsDb();
     }
@@ -3361,12 +3932,12 @@ function confirmRemoveViolationEntry(player, entry, filter, pageIndex) {
       notifyFormFailed(player, "Remove Violation Entry");
       return openNextTick(() => openViolationList(player, filter, pageIndex));
     }
-    if (res.canceled || res.selection === 0) return openNextTick(() => openViolationList(player, filter, pageIndex));
-    if (!violationsDbLoaded) loadViolationsDb();
-    delete violationsDb[key];
-    queueSaveViolationsDb();
-    try { player.sendMessage(`§aRemoved ${entry?.name ?? "player"} from the violations list.`); } catch {}
-    openNextTick(() => openViolationList(player, filter, pageIndex));
+  if (res.canceled || res.selection === 0) return openNextTick(() => openViolationList(player, filter, pageIndex));
+  if (!violationsDbLoaded) loadViolationsDb();
+  delete violationsDb.profiles[key];
+  queueSaveViolationsDb();
+  try { player.sendMessage(`§aRemoved ${entry?.name ?? "player"} from the violations list.`); } catch {}
+  openNextTick(() => openViolationList(player, filter, pageIndex));
   }).catch((e) => {
     dbgError("ui", `Remove violation entry failed: ${e}`);
     logConsoleWarn(`[Anti-Dupe] Remove violation entry failed: ${e}`);
@@ -3840,6 +4411,47 @@ function addToggleCompat(form, label, defaultValue = false, tooltip = "") {
         return form;
       }
     }
+  }
+}
+
+// ModalFormData.slider compatibility wrapper.
+let sliderCompatLogged = false;
+function addSliderCompat(form, label, min, max, step, defaultValue) {
+  try {
+    form.slider(label, min, max, step, defaultValue);
+    if (!sliderCompatLogged) {
+      const msg = "Slider overload active: slider(label, min, max, step, defaultValue)";
+      dbgInfo("ui", msg);
+      sliderCompatLogged = true;
+    }
+    return form;
+  } catch (e1) {
+    if (String(e1).includes("Incorrect number of arguments")) {
+      try {
+        form.slider(label, min, max, defaultValue);
+        if (!sliderCompatLogged) {
+          const msg = "Slider overload active: slider(label, min, max, defaultValue)";
+          dbgInfo("ui", msg);
+          sliderCompatLogged = true;
+        }
+        return form;
+      } catch (e2) {
+        try {
+          form.slider(label, min, max);
+          if (!sliderCompatLogged) {
+            const msg = "Slider overload active: slider(label, min, max)";
+            dbgInfo("ui", msg);
+            sliderCompatLogged = true;
+          }
+          return form;
+        } catch (e3) {
+          dbgError("ui", `slider attach failed: ${e1} | ${e2} | ${e3}`);
+          return form;
+        }
+      }
+    }
+    dbgError("ui", `slider attach failed: ${e1}`);
+    return form;
   }
 }
 
@@ -4592,6 +5204,24 @@ world.beforeEvents.itemUse.subscribe((event) => {
     });
   } catch (e) {
     dbgError("ui", `itemUse menu open error: ${e}`);
+  }
+});
+
+world.beforeEvents.itemUseOn.subscribe((event) => {
+  try {
+    const source = event.source;
+    const itemStack = event.itemStack;
+
+    if (!source?.hasTag?.(ADMIN_TAG)) return;
+    if (!itemStack || itemStack.typeId !== SETTINGS_ITEM) return;
+
+    event.cancel = true;
+
+    system.run(() => {
+      openMainMenu(source);
+    });
+  } catch (e) {
+    dbgError("ui", `itemUseOn menu open error: ${e}`);
   }
 });
 
