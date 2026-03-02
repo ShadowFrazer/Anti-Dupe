@@ -5,6 +5,14 @@ import { ModalFormData, MessageFormData, ActionFormData } from "@minecraft/serve
 
 const SCAN_RADIUS = 4;
 const BLOCKS_PER_TICK_LIMIT = 2000;
+const WORLD_MIN_Y = -64;
+const WORLD_MAX_Y = 319;
+
+function getClampedScanYRange(by, scanRadius) {
+  const yStart = Math.max(WORLD_MIN_Y, by - scanRadius);
+  const yEnd = Math.min(WORLD_MAX_Y, by + scanRadius);
+  return { yStart, yEnd };
+}
 
 // Illegal stack enforcement
 const ILLEGAL_STACK_HARD_CAP = 64;   // hard cap
@@ -2412,6 +2420,17 @@ function* mainScanner() {
         const bx = Math.floor(cx);
         const by = Math.floor(cy);
         const bz = Math.floor(cz);
+        const { yStart, yEnd } = getClampedScanYRange(by, SCAN_RADIUS);
+
+        if (by < WORLD_MIN_Y || by > WORLD_MAX_Y) {
+          dbgOncePer(
+            `scanner_oob_${player.name}`,
+            200,
+            "warn",
+            "scanner",
+            `Player Y=${by} is outside world bounds; scanner clamped to ${yStart}..${yEnd}.`
+          );
+        }
 
         const checkPlant   = !!globalConfig.plantPatch;
         const checkHopper  = !!globalConfig.hopperPatch;
@@ -2419,9 +2438,9 @@ function* mainScanner() {
         if (!checkPlant && !checkHopper && !checkDropper) continue;
 
         for (let dx = -SCAN_RADIUS; dx <= SCAN_RADIUS; dx++) {
-          for (let dy = -SCAN_RADIUS; dy <= SCAN_RADIUS; dy++) {
+          for (let y = yStart; y <= yEnd; y++) {
             for (let dz = -SCAN_RADIUS; dz <= SCAN_RADIUS; dz++) {
-              const pos = { x: bx + dx, y: by + dy, z: bz + dz };
+              const pos = { x: bx + dx, y, z: bz + dz };
               const block = dim.getBlock(pos);
 
               if (block) {
@@ -2441,6 +2460,18 @@ function* mainScanner() {
           }
         }
       } catch (e) {
+        const msg = String(e);
+        if (msg.includes("LocationOutOfWorldBoundariesError")) {
+          dbgOncePer(
+            `scanner_boundary_error_${player?.name ?? "unknown"}`,
+            200,
+            "warn",
+            "scanner",
+            `Boundary-safe scanner skipped an out-of-bounds access for ${player?.nameTag ?? player?.name ?? "player"}: ${msg}`
+          );
+          continue;
+        }
+
         console.warn(`[ERROR] Scanner crashed on player: ${e}`);
         dbgError("scanner", `Scanner crashed on a player loop: ${e}`);
       }
